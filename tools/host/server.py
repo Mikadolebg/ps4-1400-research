@@ -9,14 +9,19 @@ stores the binary evidence dumps they send.
 Endpoints beyond static files:
   /log/<marker>            records one verdict marker (sent by the pages)
   /dump/<name>/<off-hex>/<hex-bytes>
-                           appends a binary chunk to runs/dumps/<name>.bin
+                           appends a binary chunk to extraction/<name>.bin
                            at the given RELATIVE offset (< 1 MB guard)
 
-Output (all git-ignored, under runs/ next to the repo root):
-  journal_YYYY-MM-DD.log   everything, timestamped, with the client IP
-  last-session.txt         full trace of the latest session
-  last-verdicts.txt        the verdict lines only
-  dumps/<name>.bin         binary evidence (stubs, gadgets, anchors...)
+Output (all git-ignored except the README):
+  runs/                    the logs: journal_YYYY-MM-DD.log (everything,
+                           timestamped, with the client IP),
+                           last-session.txt (full trace of the latest
+                           session), last-verdicts.txt (verdict lines)
+  extraction/              every binary captured from the console: the
+                           one-click extractions (libkernel-window.bin,
+                           stubzone.bin, webkit-text.bin, anchor-*.bin)
+                           and the per-run evidence dumps (gadg-*,
+                           stub-*, fcall-*...). See extraction/README.md.
 
 Usage:
   python tools/host/server.py [--port 8000] [--bind 0.0.0.0]
@@ -81,15 +86,16 @@ class HostHandler(SimpleHTTPRequestHandler):
                 return
             name = parts[0][:64].replace("\\", "_").replace(".", "_")
             offset = int(parts[1], 16)
-            # Guard: offsets are RELATIVE to the dump start (< 1 MB).
+            # Guard: offsets are RELATIVE to the dump start (< 4 MB - the
+            # largest legitimate extraction is the 2 MB WebKit slice).
             # A huge value means a page bug (an absolute address was
             # sent) -> refuse, never grow a file to gigabytes.
-            if offset > 0x100000:
+            if offset > 0x400000:
                 print("[%s] DUMP-REFUSED offset=0x%x too large (relative expected)"
                       % (datetime.now().strftime("%H:%M:%S"), offset), flush=True)
                 return
             data = bytes.fromhex(parts[2])
-            ddir = os.path.join(RUNS_DIR, "dumps")
+            ddir = EXTRACTION_DIR
             os.makedirs(ddir, exist_ok=True)
             fp = os.path.join(ddir, name + ".bin")
             with _write_lock:
@@ -136,7 +142,7 @@ class HostHandler(SimpleHTTPRequestHandler):
 
 
 def main():
-    global RUNS_DIR
+    global RUNS_DIR, EXTRACTION_DIR
     ap = argparse.ArgumentParser(description="PS4 14.00 research host server")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--bind", default="0.0.0.0")
@@ -145,12 +151,24 @@ def main():
     RUNS_DIR = os.path.join(REPO_ROOT, "runs")
     os.makedirs(RUNS_DIR, exist_ok=True)
 
+    EXTRACTION_DIR = os.path.join(REPO_ROOT, "extraction")
+    os.makedirs(EXTRACTION_DIR, exist_ok=True)
+    readme = os.path.join(EXTRACTION_DIR, "README.md")
+    if not os.path.exists(readme):
+        with open(readme, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# extraction/ - binary captures from the console\n\n"
+                    "This folder receives everything the console pages "
+                    "stream to /dump/.\nIt is git-ignored; the committed "
+                    "explanation lives next to it in the repository\n"
+                    "(re-run tools/host/server.py from a checkout to get "
+                    "the full README).\n")
+
     # serve the repository root
     os.chdir(REPO_ROOT)
 
     server = ThreadingHTTPServer((args.bind, args.port), HostHandler)
-    print("Serving %s on port %d (log/dumps under runs/)" % (REPO_ROOT, args.port),
-          flush=True)
+    print("Serving %s on port %d" % (REPO_ROOT, args.port), flush=True)
+    print("Logs -> runs/ ; console captures -> extraction/", flush=True)
     print("Open on the console: http://<this-PC-IP>:%d/  (menu)" % args.port,
           flush=True)
     print("Ctrl+C to stop.", flush=True)

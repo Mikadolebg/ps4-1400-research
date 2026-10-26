@@ -98,6 +98,15 @@ Results stream back into `bridge/results.jsonl`; file exports land in
 `bridge/files/`. The page stays armed for the whole session — leave it
 open and work from the PC.
 
+5. **One-click extraction.** The workshop page has EXTRACT buttons
+(the libkernel stub table, the stub zone only, the WebKit text slice,
+the proof anchors): each streams the memory range through the armed
+primitive and assembles the file in **`extraction/` on the PC**
+(progress on the page status line; the same targets work over the
+bridge: `echo {"t":"extract","what":"libkernel"} >>
+bridge/commands.jsonl`). What each file is and what to run on it:
+`extraction/README.md`.
+
 ## 6. The aio KEX reproduction (optional)
 
 Pick **KEX AIO** on the menu. The page plays the scene's exact P1->P5

@@ -7,7 +7,11 @@ bridge/
 logs/
 *.log
 
-# Local memory dumps (share them via GitHub Releases instead, never commit)
+# Local binary captures from the console (the README stays tracked)
+extraction/*
+!extraction/README.md
+
+# Local memory dumps kept elsewhere (share via GitHub Releases, never commit)
 dumps/
 *.bin
 

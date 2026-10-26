@@ -24,6 +24,9 @@ Supported commands (see docs/04-terrain-map.md for recipes):
                                              returns a POSITIVE errno
                                              in rax on error
   {"t":"eval","code":"2+2"}                  remote JS evaluation
+  {"t":"extract","what":"libkernel"}        one-click extraction (also:
+                                             stubzone / webkit / anchors)
+                                             -> files land in extraction/
   {"t":"selftest"}                           built-in suite (devices,
                                              evf/aio errno probes)
   {"t":"arm","slots":5000000,"n":512}        to a connected boot page

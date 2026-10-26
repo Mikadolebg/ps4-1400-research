@@ -25,11 +25,13 @@
   and in the PC server log. Reload to re-run; after a crash, close and
   reopen the browser.</small>
 
-  <a href="tools/workshop/boot.html" class="a2">&#9654; WORKSHOP - live console</a>
+  <a href="tools/workshop/boot.html" class="a2">&#9654; WORKSHOP - live console + extraction</a>
   <small>The thin boot page arms the full workshop on command (from the PC
   bridge or the buttons) and hands over to console.html: remote eval, FS
-  walking inside the prison, arbitrary syscalls with positive-errno reads.
-  Needs bridge.py running on the PC. Leave the page open.</small>
+  walking inside the prison, arbitrary syscalls with positive-errno reads
+  - and one-click EXTRACT buttons: the libkernel stub table, the WebKit
+  gadget slice, the proof anchors, all streamed to the extraction/ folder
+  on the PC. Needs bridge.py running on the PC. Leave the page open.</small>
 
   <a href="tools/workshop/kex-aio.html" class="a3">KEX AIO - the scene sequence</a>
   <small>The public aio kernel-exploit sequence (P1->P5) replayed on 14.00.

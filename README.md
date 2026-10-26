@@ -23,9 +23,13 @@ tools/host/             PC-side host: server.py (verdict-marker logging +
                         start.bat / start.sh (the stable launcher).
 tools/workshop/         The live workshop: boot.html (thin arming page),
                         console.html (the armed console — remote eval, FS
-                        walking, arbitrary syscalls with errno reads) and
-                        kex-aio.html (the scene's aio kernel-exploit
+                        walking, arbitrary syscalls with errno reads, and
+                        one-click EXTRACT buttons streaming to extraction/)
+                        and kex-aio.html (the scene's aio kernel-exploit
                         sequence, replayed on 14.00).
+extraction/             Where every console capture lands (local,
+                        git-ignored): the one-click extractions and the
+                        per-run evidence dumps — README.md maps each file.
 tools/extraction/       Regenerate our data from your own console:
                         dump-libkernel.md (the dump recipe),
                         extract-stubs.py, extract-gadgets.py.

@@ -2,7 +2,7 @@
 
 The pages emit marker lines to the screen, to the host server
 (`/log/`, captured in `runs/last-verdicts.txt`), and evidence dumps
-(`/dump/` → `runs/dumps/*.bin`). Markers are the product's
+(`/dump/` -> `extraction/*.bin`). Markers are the product's
 vocabulary — stable, functional, and self-describing. This glossary
 tells you what each one *proves*.
 
@@ -65,5 +65,7 @@ tells you what each one *proves*.
 |---|---|
 | `ERRNO-GADGET-OK` | the bare `syscall; ret` gadget found at the stub-window tail — positive errno reads available (`sysc raw=1`) |
 | `BRIDGE-OPEN` | the WebSocket bridge to the PC is up |
-| `WORKSHOP-READY` | the armed live console is taking commands (ping/stat/walk/read/sysc/eval/selftest), heartbeat every 5 s |
+| `WORKSHOP-READY` | the armed live console is taking commands (ping/stat/walk/read/sysc/eval/selftest/extract), heartbeat every 5 s |
 | `EVF-REGISTRY-OPEN/CLOSED`, `PRISON-*` | verdicts of the named-IPC and FS-map probes driven over the bridge |
+| `EXT-START` / `EXT-DONE` | a one-click extraction ran: the named target streamed to `extraction/` on the PC (buttons on the page, or `{"t":"extract","what":...}` over the bridge) |
+| `EXT-FAIL` | extraction refused: primitive not armed yet, already running, or unknown target / base missing |

@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 Versioning follows the repo as a whole — individual files never carry
 version numbers (git history is the only file history).
 
+## [Unreleased]
+
+- **One-click extraction from the workshop**: EXTRACT buttons on the
+  console page (libkernel stub table, stub zone, WebKit text slice,
+  proof anchors) and a matching `{"t":"extract","what":...}` bridge
+  command. All captures now land in the dedicated `extraction/` folder
+  on the PC (git-ignored, self-documenting via its README), replacing
+  the old `runs/dumps/` location. New markers: `EXT-START`, `EXT-DONE`,
+  `EXT-FAIL`.
+
 ## v1.0.0 — 2026-10-26
 
 Initial public release. State of the research at this date:

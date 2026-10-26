@@ -7,6 +7,26 @@ stock 14.00 console — the same dump you can regenerate with the armed
 workshop. No kernel access is involved: it is userland memory of the
 browser process, read through the proven R/W primitive.
 
+## The easy way: one click (or one command)
+
+The workshop console ships the extraction built in. Once armed
+(`WORKSHOP-READY`):
+
+- on the **PlayStation page**: the `EXTRACT - libkernel window` button
+  (progress on the status line; the file assembles in
+  `extraction/libkernel-window.bin` on the PC);
+- from the **PC**, over the bridge:
+
+```sh
+echo {"t":"extract","what":"libkernel"} >> bridge/commands.jsonl
+```
+
+The other buttons / `what` values: `stubzone` (just the dense zone,
+fast), `webkit` (the low 2 MB of WebKit text — the gadget set),
+`anchors` (the proof anchors: the pair door, the GOT slot, the getpid
+stub, the errno gadget). The full file map of `extraction/` lives in
+`extraction/README.md`.
+
 ## How the window is located at runtime
 
 1. The chain runs (see `REPRODUCE.md`) with the **workshop console**
@@ -19,7 +39,7 @@ browser process, read through the proven R/W primitive.
    the dense stub table zone sits at `+0x52B0..+0x7A00`, the bare
    `syscall; ret` errno gadget at `+0x6A2A`.
 
-## The dump procedure (copy-paste for the bridge `eval` command)
+## The manual way (the eval recipe, equivalent to the button)
 
 With `bridge.py` running and the workshop armed, push this through the
 bridge (one JSON line per command in `bridge/commands.jsonl`):
@@ -30,7 +50,7 @@ bridge (one JSON line per command in `bridge/commands.jsonl`):
 
 What it does: walks the window in 1 KB chunks, hex-encodes each chunk
 through `ext_read8` (the R/W primitive) and streams it to the server's
-`/dump/` endpoint, which assembles `runs/dumps/libkernel-window.bin`
+`/dump/` endpoint, which assembles `extraction/libkernel-window.bin`
 (offsets are relative — the server guards against absolute-address
 mistakes). ~424 chunks, a few minutes at heartbeat cadence.
 
@@ -47,7 +67,7 @@ Notes:
 ## Then: regenerate the table
 
 ```sh
-python tools/extraction/extract-stubs.py runs/dumps/libkernel-window.bin \
+python tools/extraction/extract-stubs.py extraction/libkernel-window.bin \
     --verify-console-table
 ```
 
@@ -64,5 +84,5 @@ same way (the base is known from `BASE-LOCKED`; e.g. window
 anchor changed to the module base), then:
 
 ```sh
-python tools/extraction/extract-gadgets.py runs/dumps/webkit-text.bin --rva 0x0
+python tools/extraction/extract-gadgets.py extraction/webkit-text.bin --rva 0x0
 ```

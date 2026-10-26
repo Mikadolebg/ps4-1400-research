@@ -136,6 +136,7 @@ function read(p) {
         "tools/extraction/extract-stubs.py",
         "tools/extraction/extract-gadgets.py",
         "tools/extraction/dump-libkernel.md",
+        "extraction/README.md",
         "data/markers.md", "data/offsets/webkit-1400.md",
         "data/offsets/kernel-1400.md", "data/syscalls/README.md",
         "data/syscalls/DANGEROUS.md", "data/syscalls/gates-1400.csv",
