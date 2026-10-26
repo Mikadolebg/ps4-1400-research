@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PS4 14.00 research</title>
+<style>
+  body { background:#111; color:#eee; font-family:sans-serif; text-align:center; padding-top:30px; }
+  h2 { color:#fff; margin-bottom:4px; }
+  a { display:block; margin:10px auto; width:520px; padding:14px 0; font-size:24px;
+      color:#fff; text-decoration:none; border-radius:10px; }
+  a.a1 { background:#16a34a; }
+  a.a2 { background:#dc2626; font-size:30px; padding:20px 0; }
+  a.a3 { background:#2563eb; }
+  small { color:#999; font-size:14px; display:block; margin:4px auto; max-width:560px; }
+</style>
+</head>
+<body>
+  <h2>PS4 14.00 research</h2>
+  <div style="color:#4ade80;font-size:16px;margin-bottom:14px">
+    Userland proven. One kernel primitive missing.</div>
+
+  <a href="poc/poc.html" class="a1">&#9654; POC - the proof of concept</a>
+  <small>The whole chain in one page: SSV entry -> arbitrary R/W -> WebKit
+  base -> verified ROP -> one syscall (getpid). Verdict markers appear here
+  and in the PC server log. Reload to re-run; after a crash, close and
+  reopen the browser.</small>
+
+  <a href="tools/workshop/boot.html" class="a2">&#9654; WORKSHOP - live console</a>
+  <small>The thin boot page arms the full workshop on command (from the PC
+  bridge or the buttons) and hands over to console.html: remote eval, FS
+  walking inside the prison, arbitrary syscalls with positive-errno reads.
+  Needs bridge.py running on the PC. Leave the page open.</small>
+
+  <a href="tools/workshop/kex-aio.html" class="a3">KEX AIO - the scene sequence</a>
+  <small>The public aio kernel-exploit sequence (P1->P5) replayed on 14.00.
+  Measures that the wait (663) is gated: verdict AIO-LIVE-NO-RECLAIM.
+  If a future firmware re-enables it, this page becomes the kernel
+  exploit unchanged.</small>
+
+  <br>
+  <small style="color:#666">Ritual: clean browser, menu, click. A miss =
+  reload (F5). One arm->calls->disarm cycle per session (the law).</small>
+</body>
+</html>

