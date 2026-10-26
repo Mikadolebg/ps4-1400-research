@@ -179,7 +179,11 @@ function EXT_click(what) {
         EXT_status("not armed yet - wait for WORKSHOP-READY, then press.");
         return;
     }
-    EXT_run(what);
+    if (typeof window.EXT_run !== "function") {
+        EXT_status("extractor not installed yet - one moment.");
+        return;
+    }
+    window.EXT_run(what);
 }
 
 function buffer(size) {
@@ -2533,6 +2537,9 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
                 });
             })(0);
         }
+        window.EXT_run = EXT_run;   // expose to the page buttons
+                                    // (EXT_click lives in global scope;
+                                    // without this it hit a ReferenceError)
         EXT_ready = true;
         try {
             var extBtns = document.querySelectorAll("#extbar button");

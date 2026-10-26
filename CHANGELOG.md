@@ -17,6 +17,10 @@ version numbers (git history is the only file history).
   `extraction/` unless a button or a bridge command started it.
   Buttons unlock visibly at WORKSHOP-READY (grayed out before). New
   markers: `EXT-START`, `EXT-DONE`, `EXT-FAIL`.
+- Fix: the page buttons could not reach the extractor — `EXT_run` lived
+  inside the live layer's scope while the button handler is global
+  (silent ReferenceError on press; the bridge path was unaffected). The
+  extractor is now exposed explicitly and the handler guards for it.
 
 ## v1.0.0 — 2026-10-26
 
