@@ -5,7 +5,7 @@ Status legend: **OPEN** (measured alive somewhere, 14.00 unknown),
 tool in this repo that takes you there. Read `06-negative-results.md`
 first — several intuitive leads there are closed.
 
-## 1. `/dev/dipsw` ioctl window — UNTESTED, highest value-per-unknown
+## 2. `/dev/dipsw` ioctl window — UNTESTED, highest value-per-unknown
 
 **What is proven already:** `open("/dev/dipsw")` **succeeds** from the
 browser (an fd comes back; reads fail — ioctl-only device). The 13.52
@@ -22,7 +22,7 @@ control surface. Nothing about its ioctls has ever been published.
 ioctl via the stub with errno readout, sweeping the documented command
 window one command at a time (DANGER list rules apply: never blind-loop).
 
-## 2. The unauthenticated IPC registry from a non-gated process — OPEN (F2)
+## 3. The unauthenticated IPC registry from a non-gated process — OPEN (F2)
 
 **What is proven:** the kernel-side global registry of named evf/osem
 objects has **no authentication** (13.52 disassembly); the browser is
@@ -41,17 +41,6 @@ primitive from the right context.
 Remote Play registration surface (below) is the closest
 browser-influenceable daemon.
 
-## 3. `mdbg_call` (573) and the debugger bridge — UNTESTED on 14.00
-
-**What is known:** the 13.52 kernel exposes the mdbg (debugger
-backdoor) call with VA->phys translation and **no gate seen**; the
-`/system_tmp/mdbg0_dbbp` socket is alive on 14.00. Stub present in
-the browser table.
-
-**Next probe:** `sysc 573` with minimal args + `raw:true` for the
-errno identity (before anything else — DANGER discipline), then the
-documented ABI shapes from the 13.52 study.
-
 ## 4. The `/system_tmp` sockets (GnmCompositor, gpvdec/gpvenc arbiters) — UNTESTED
 
 Live UNIX sockets of graphics system processes, reachable by name
@@ -62,24 +51,27 @@ has no row yet for AF_UNIX connects to these).
 **Next probe:** `socket`+`connect` via the workshop (one syscall pair,
 errno read), then `stat`/`read` on the socket files.
 
-## 5. The bnet `raise` write-UAF (N1) — OPEN, high risk / high value
+## 1. The bnet `raise` write-UAF (N1) — OPEN, entry chain PROVEN LIVE on 14.00
 
-**What is proven (byte-exact, 13.52 kernel):** the bnet error-raising
-path captures its owner (a socket struct, UMA zone 0x478) under locks,
-then **writes** `word 4` at `owner+0x70` and `word 0xa5` at
-`[owner+0x360]+0x70` **after releasing the locks, without taking a
-reference** — reachable from the browser through 4 real stubs
-(97/98/99/114). No KASLR needed for a proof-of-touch (command
-0x10000002 path).
+**What is proven (2026-10-27, stock 14.00 console, through the armed
+workshop):** the whole netevent chain runs from the browser with zero
+gates — socket, REGISTER (owner = our socket, no reference), voluntary
+RAISE, and the sensor read back `events = 0x4` (the raise's literal
+mask) from OUR queue. Live interfaces: ids 1-4. Corrected ABI:
+`netcontrol(id, cmd, ptr, len)`; raise trigger `0x20000010`.
 
-**Honest cost:** the race window is ~15 bytes of code wide — "a
-preemption lottery". Never tested on console. Full design:
-`05-audits/bnet-n1.md`.
+**What remains (the hard part, honestly rated):** the race — close the
+socket while a raise sits in the ~15-byte post-unlock window, then
+reoccupy the freed 0x478 socket block. Per-event probability is tiny
+(the incoming-HTTP traffic raises continuously; each attempt is a
+preemption lottery), and a lost attempt in a bad state is a kernel
+panic (accepted, documented, reboot). The winning signal without KASLR:
+the reoccupied socket's connect() returning an abnormal errno.
 
-**Next probe:** the KASLR-free touch proof first (does the write land
-in our own socket's field?), concurrency only after.
+**Next probe:** a raise-and-close loop driven from the PC (one cycle
+per session per the law), with the console state saved beforehand.
 
-## 6. Remote Play parsers (TCP 9295 / UDP 987, console side) — OPEN
+## 5. Remote Play parsers (TCP 9295 / UDP 987, console side) — OPEN
 
 The console-side daemon (`NPXS21006`) accepts discovery (UDP 987) and
 registration (TCP 9295) **without pairing**, from the LAN. Our fuzz
@@ -92,7 +84,7 @@ second front.
 **Next probe:** console into Remote Play PIN-pairing mode, rerun the
 fuzzer against ctrl; the harness recipe is in `05-audits/remote-play.md`.
 
-## 7. Untested stub families (batch probes, cheap) — UNTESTED
+## 6. Untested stub families (batch probes, cheap) — UNTESTED
 
 572 (`virtual_query`), 482 (`shm_open` — its gate passed the browser
 in the 13.52 bt-gate decode), 657 (`blockpool_batch`, zero gates in
@@ -102,6 +94,7 @@ in the 13.52 bt-gate decode), 657 (`blockpool_batch`, zero gates in
 ## What NOT to do (closed — see 06)
 
 The aio wait, 622, evf/osem creation from the browser, dmem/aout
-opens, blind 500-550 sweeps, the fake 1400 offset files. All closed
+opens, mdbg_call 573 (gated by credential class — proven in the 13.52
+disassembly), blind 500-550 sweeps, the fake 1400 offset files. All closed
 with evidence; reopening any of them requires a firmware change or a
 new primitive.

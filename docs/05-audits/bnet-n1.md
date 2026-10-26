@@ -1,13 +1,35 @@
-# Audit: bnet `raise` — the write-UAF (N1), never tested on console
+# Audit: bnet `raise` — the write-UAF (N1)
 
 **Terrain:** the bnet error-raising path (network stack), 13.52 clear
 kernel; browser-reachable through 4 real stubs (97 `socket`, 98, 99
-`netcontrol`, 114).
-**Method:** instruction-level audit of the network+GPU stacks; the
-finding was confirmed byte-exact at the disassembly level and
-cross-checked against the live reachability measurements.
-**Status: OPEN — designed, never played on hardware. The strongest
-untested in-browser kernel lead, and the hardest to land.**
+`netcontrol`, 114 `close`).
+**Method:** instruction-level audit of the network+GPU stacks, confirmed
+byte-exact; then — **2026-10-27 — the entry chain was proven LIVE on a
+stock 14.00 console** through the armed workshop (probe driven over the
+bridge; sequence below).
+**Status: OPEN — the netevent chain is armed from the browser on 14.00
+(the prerequisite of the UAF is in place); the race itself remains to be
+played (accepted panic risk).**
+
+## On-device proof (2026-10-27, stock 14.00 browser)
+
+Corrected ABI (the original internal design had it swapped — this was
+why the earlier on-device attempt failed): `netcontrol(id, cmd, ptr,
+len)`, and the voluntary-raise command is **0x20000010** (not
+0x10000010):
+
+| Step | Call | Result |
+|---|---|---|
+| socket | `sysc(97,[2,1,0])` | fd=6 |
+| id sweep | `netcontrol(i, 0x20000010, buf, 4)` — NULL-safe raise | **ids 1-4 alive (raise ran); 5-8 absent** |
+| REGISTER | `netcontrol(1, 0x20000003, {fd}, 8)` | **0 — our queue registered, owner = our socket, no reference taken** |
+| RAISE | `netcontrol(1, 0x20000010, buf, 4)` | 0 |
+| SENSOR | `netcontrol(1, 0x10000002, kbuf{fd}, 0x20)` | **0; events = 0x4, qid = 6** |
+
+`events = 4` is the literal mask the raise handler writes when
+`ifnet+0xa4 == 2` (`mov esi,4` @+0x1e1046): **the raise ran on OUR
+queue with OUR socket as the owner — on 14.00, from the browser.**
+No gate anywhere on the path (unlike the aio wait / named IPC / 622).
 
 ## The bug (byte-exact)
 
@@ -33,18 +55,16 @@ design doc rates it exactly that: high value, low probability per
 attempt, deterministic *proof* available before any exploitation
 attempt.
 
-## The KASLR-free proof of touch (the first probe, never run)
+## The KASLR-free proof of touch (played 2026-10-27 — see above)
 
-Command shape `0x10000002` on a socket we own: if the write lands in
-**our own** socket's field (no race, no free needed), the proof reads
-back the touched value through normal socket state — establishing the
-write path exists and is reachable from the browser's 4 stubs, with
-zero crash risk. Only after that proof does the race (free the socket
-under the window, spray the UMA zone) make any sense.
+The register + voluntary raise + sensor sequence just played on 14.00 IS
+that proof: the sensor read back the accumulated event mask of OUR queue
+(`events = 0x4`), establishing that the write path exists and is
+reachable from the browser's stubs, with zero crash risk. The race (free
+the socket under the window, spray the UMA zone) is the remaining step.
 
 ## Why it survived the 14.00 gates
 
-The 4 stubs it needs are **not gated** (the socket infrastructure
-works — the aio sequence uses it heavily). The hardened frontier on
-14.00 (gates table) does not cover this path; only hardware time
-does.
+The 4 stubs it needs are **not gated** (proven live above — netcontrol
+register/raise/sensor all returned 0). The hardened frontier on 14.00
+(gates table) does not cover this path; only hardware time does.

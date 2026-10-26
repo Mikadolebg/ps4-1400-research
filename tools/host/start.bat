@@ -36,7 +36,7 @@ if "%LANIP%"=="" (
 echo.
 echo   Session log:    runs\last-session.txt + runs\last-verdicts.txt
 echo   Bridge data:    bridge\  (commands.jsonl / results.jsonl / files\)
-echo   Live commands:  echo {"t":"ping"} >> bridge\commands.jsonl
+echo   Live commands:  echo {"t":"ping"} ^>^> bridge\commands.jsonl
 echo   Stop: Ctrl+C
 echo ================================================================
 echo.

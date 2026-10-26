@@ -26,6 +26,7 @@ was wrong).
 | 15 | "webkit_gadgets_1400.js" circulating files (adri22235 commit 349e4c1) | **REFUTED (fake)** | All 17 "1400" gadget values byte-identical to the 1304 file; the repo's own later commit admits synthetic generation "PENDING_DUMP". Never import. (The *kernel* 1400 offsets in that repo are genuine - Scene-Collective's - and are what we reuse.) |
 | 16 | "1400 kpatch binaries" (XEMIXJB family) | **REFUTED (fake)** | md5 of `patches/1400.bin` == md5 of the 1352 kpatch == the file zecoxao serves for 1352. Renamed, not ported. |
 | 17 | Direct syscall escape from the sandbox (state-allocating calls) | **CLOSED** | The tar pit: kqueue/umtx/setuid/device-opens pend forever in the browser (5/5 measured). Escaping the browser class requires a kernel bug, not a syscall trick. |
+| 18a | `mdbg_call` (573) from the browser | **CLOSED (gated by credential class)** | The 13.52 handler calls the sceSblACMgr family (0x3b2ce0) at entry via td+0x130 and returns 0x4e when the class is wrong — the earlier "no gate" audit note was incorrect. Disassembly 2026-10-27. |
 | 18 | KEX Lapse (`aio_multi_delete`, 11.00-12.02 family) / KEX Poops (12.50-13.00) as-is | **CLOSED (superseded by row 1)** | Those chains call into the same gated wait-side family; the 14.00 closure of the wait covers them. |
 
 **The pattern across all rows:** 14.00 did not add bugs — it added
