@@ -5,18 +5,25 @@ host's `/dump/` endpoint**. It is local-only (git-ignored; this README
 is the only tracked file in here). The logs and verdict markers live
 separately in `runs/`.
 
-## The one-click extractions (buttons on the workshop page, or
-`{"t":"extract","what":...}` over the bridge)
+## The one-click extractions (one button = one target, on the workshop
+page; or `{"t":"extract","what":...}` over the bridge)
 
 | File | What it is | How it was produced | Size |
 |---|---|---|---|
-| `libkernel-window.bin` | The libkernel window `[__error, +0x6A000)` — the browser's syscall stub table lives at `+0x52B0..+0x7A00` and the bare `syscall; ret` errno gadget at `+0x6A2A`. Regenerate `data/syscalls/stubs-1400.csv` from it with `tools/extraction/extract-stubs.py`. | button `EXTRACT - libkernel window` / `{"t":"extract","what":"libkernel"}` | ~424 KB |
-| `stubzone.bin` | Just the dense stub zone (`+0x52B0..+0x7A00`) — the fast version of the above. | button `EXTRACT - stub zone only` / `{"t":"extract","what":"stubzone"}` | ~9 KB |
-| `webkit-text.bin` | The low 2 MB of the libSceWebKit2 text (module base = byte 0) — covers the low-RVA gadget set of `data/offsets/webkit-1400.md`. Verify offline with `tools/extraction/extract-gadgets.py webkit-text.bin --rva 0x0`. | button `EXTRACT - WebKit text slice` / `{"t":"extract","what":"webkit"}` | 2 MB |
-| `anchor-expm1.bin`, `anchor-parseint.bin` | The two builtin anchors of the base-leak pair door (RVAs `0x2586880` / `0xD5C60`). | button `EXTRACT - proof anchors` | 0x100 each |
-| `anchor-imp-error.bin` | The `__imp___error` GOT slot (RVA `0x3CB8CC8`) — dereferencing it gives the libkernel `__error` anchor of every stub offset. | same | 8 B |
-| `anchor-base-start.bin` | The first 0x200 bytes of the WebKit module (header proof of the locked base). | same | 0x200 |
-| `stub-getpid.bin`, `errno-gadget.bin` | The getpid stub (`__error+0x6CF0`) and the bare `syscall; ret` gadget (`__error+0x6A2A`), byte-proof of the two addresses the tooling calls. | same | 0x20 / 0x10 |
+| `libkernel-window.bin` | The libkernel window `[__error, +0x6A000)` — the browser's syscall stub table lives at `+0x52B0..+0x7A00` and the bare `syscall; ret` errno gadget at `+0x6A2A`. Regenerate `data/syscalls/stubs-1400.csv` from it with `tools/extraction/extract-stubs.py`. | button `libkernel window` / `what=libkernel` | ~424 KB |
+| `stubzone.bin` | Just the dense stub zone (`+0x52B0..+0x7A00`) — the fast version of the above. | button `stub zone only` / `what=stubzone` | ~9 KB |
+| `webkit-text.bin` | The low 2 MB of the libSceWebKit2 text (module base = byte 0) — covers the low-RVA gadget set of `data/offsets/webkit-1400.md`. Verify offline with `tools/extraction/extract-gadgets.py webkit-text.bin --rva 0x0`. | button `WebKit text slice` / `what=webkit` | 2 MB |
+| `anchor-expm1.bin` | The `Math.expm1` builtin anchor of the base-leak pair door (RVA `0x2586880`). | button `anchor: expm1` / `what=anchor-expm1` | 0x100 |
+| `anchor-parseint.bin` | The `parseInt` builtin anchor (RVA `0xD5C60`) — the pair closes at delta `0x24B0C20`. | button `anchor: parseInt` / `what=anchor-parseint` | 0x100 |
+| `anchor-imp-error.bin` | The `__imp___error` GOT slot (RVA `0x3CB8CC8`) — dereferencing it gives the libkernel `__error` anchor of every stub offset. | button `anchor: __error GOT` / `what=anchor-imp-error` | 8 B |
+| `anchor-base-start.bin` | The first 0x200 bytes of the WebKit module (header proof of the locked base). | button `anchor: module start` / `what=anchor-base-start` | 0x200 |
+| `stub-getpid.bin` | The getpid stub (`__error+0x6CF0`) — byte-proof of the canonical first syscall call. | button `stub: getpid` / `what=stub-getpid` | 0x20 |
+| `errno-gadget.bin` | The bare `syscall; ret` gadget (`__error+0x6A2A`) behind the positive-errno reads. | button `gadget: errno` / `what=errno-gadget` | 0x10 |
+
+Each button extracts exactly one thing, whenever you press it (the
+chain stays armed the whole session; nothing extracts on its own). The
+buttons unlock at `WORKSHOP-READY` — the status line under them says
+so.
 
 ## The per-run evidence dumps (automatic, every session)
 

@@ -30,18 +30,30 @@
 <meta charset="utf-8"><title>ps4 14.00 - workshop console</title>
 <body style="font:13px monospace">
 <style>
-  #extbar button { display:block; width:480px; margin:8px 0; padding:12px 0;
-      font-size:17px; color:#fff; background:#1d4ed8; border:0;
-      border-radius:8px; }
-  #extbar button.b2 { background:#7c2d12; font-size:15px; }
-  #extst { color:#4ade80; margin-bottom:6px; }
+  #extbar { position:sticky; top:0; z-index:10; background:#111;
+      padding:6px 0 8px 0; border-bottom:1px solid #333; }
+  #exttitle { color:#facc15; margin-bottom:4px; }
+  #extbar button { display:inline-block; width:32%; margin:3px 0.5%;
+      padding:11px 0; font-size:15px; color:#fff; background:#1d4ed8;
+      border:0; border-radius:8px; }
+  #extbar button.small { background:#7c2d12; font-size:13px; padding:8px 0; }
+  #extbar button:disabled { color:#777; background:#262626; }
+  #extst { color:#4ade80; margin-top:4px; }
 </style>
 <div id="extbar">
-<button onclick="EXT_click('libkernel')">EXTRACT - libkernel window (the 302-stub table)</button>
-<button onclick="EXT_click('stubzone')">EXTRACT - stub zone only (fast)</button>
-<button onclick="EXT_click('webkit')">EXTRACT - WebKit text slice (low 2 MB: the gadget set)</button>
-<button class="b2" onclick="EXT_click('anchors')">EXTRACT - proof anchors (base, pair door, getpid stub, errno gadget)</button>
-<div id="extst">extraction is one click once WORKSHOP-READY - files land in extraction/ on the PC</div>
+<div id="exttitle">EXTRACTION - one button = one target, nothing runs until you press it.<br>
+Files land in extraction/ on the PC. Buttons unlock when the chain is armed.</div>
+<button id="ext-libkernel" disabled onclick="EXT_click('libkernel')">libkernel window (302-stub table)</button>
+<button id="ext-stubzone" disabled onclick="EXT_click('stubzone')">stub zone only (fast)</button>
+<button id="ext-webkit" disabled onclick="EXT_click('webkit')">WebKit text slice (2 MB, gadgets)</button>
+<br>
+<button class="small" id="ext-anchor-expm1" disabled onclick="EXT_click('anchor-expm1')">anchor: expm1</button>
+<button class="small" id="ext-anchor-parseint" disabled onclick="EXT_click('anchor-parseint')">anchor: parseInt</button>
+<button class="small" id="ext-anchor-imp-error" disabled onclick="EXT_click('anchor-imp-error')">anchor: __error GOT</button>
+<button class="small" id="ext-anchor-base-start" disabled onclick="EXT_click('anchor-base-start')">anchor: module start</button>
+<button class="small" id="ext-stub-getpid" disabled onclick="EXT_click('stub-getpid')">stub: getpid</button>
+<button class="small" id="ext-errno-gadget" disabled onclick="EXT_click('errno-gadget')">gadget: errno</button>
+<div id="extst">arming... buttons are inert until WORKSHOP-READY</div>
 </div>
 <pre id="out"></pre>
 <script>
@@ -155,11 +167,16 @@ function hex(value) {
 }
 
 // ---- one-click extraction (UI entry; the armed live layer installs the
-// real runner - buttons stay inert until WORKSHOP-READY)
+// real runner and unlocks the buttons at WORKSHOP-READY)
 var EXT_ready = false;
+function EXT_status(t) {
+    var st = document.getElementById("extst");
+    if (st) st.textContent = t;
+}
 function EXT_click(what) {
     if (!EXT_ready) {
         mark("EXT-FAIL", "reason=primitive-not-armed-wait-for-WORKSHOP-READY");
+        EXT_status("not armed yet - wait for WORKSHOP-READY, then press.");
         return;
     }
     EXT_run(what);
@@ -2427,24 +2444,25 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
             G: G, c: c
         };
         // ---- ONE-CLICK EXTRACTION ----------------------------------------
-        // The buttons at the top of the page and {"t":"extract","what":...}
-        // over the bridge. Streams chunks to the host's /dump/ endpoint,
-        // which assembles the files under extraction/ on the PC (see
-        // extraction/README.md for the file map).
+        // One button = one target, pressed when YOU choose (nothing ever
+        // extracts on its own). Streams chunks to the host's /dump/
+        // endpoint, which assembles the files under extraction/ on the PC
+        // (see extraction/README.md for the file map).
         var EXT_CHUNK = 0x400, EXT_PER_TICK = 6, EXT_TICK_MS = 60;
-        var EXT_JOBS = {
-            libkernel: [["libkernel-window", LIBK_ERRORFN, 0x6a000]],
-            stubzone: [["stubzone", LIBK_ERRORFN + 0x52b0, 0x7a00 - 0x52b0]],
-            webkit: WK_BASE ? [["webkit-text", WK_BASE, 0x200000]] : null,
-            anchors: WK_BASE ? [
-                ["anchor-expm1", WK_BASE + 0x2586880, 0x100],
-                ["anchor-parseint", WK_BASE + 0xD5C60, 0x100],
-                ["anchor-imp-error", WK_BASE + 0x3CB8CC8, 0x8],
-                ["anchor-base-start", WK_BASE, 0x200],
-                ["stub-getpid", LIBK_ERRORFN + 0x6cf0, 0x20],
-                ["errno-gadget", LIBK_ERRORFN + 0x6a2a, 0x10]
-            ] : null
-        };
+        function EXT_target(what) {
+            var T = {
+                libkernel: [["libkernel-window", LIBK_ERRORFN, 0x6a000]],
+                stubzone: [["stubzone", LIBK_ERRORFN + 0x52b0, 0x7a00 - 0x52b0]],
+                webkit: [["webkit-text", WK_BASE, 0x200000]],
+                "anchor-expm1": [["anchor-expm1", WK_BASE + 0x2586880, 0x100]],
+                "anchor-parseint": [["anchor-parseint", WK_BASE + 0xD5C60, 0x100]],
+                "anchor-imp-error": [["anchor-imp-error", WK_BASE + 0x3CB8CC8, 0x8]],
+                "anchor-base-start": [["anchor-base-start", WK_BASE, 0x200]],
+                "stub-getpid": [["stub-getpid", LIBK_ERRORFN + 0x6cf0, 0x20]],
+                "errno-gadget": [["errno-gadget", LIBK_ERRORFN + 0x6a2a, 0x10]]
+            };
+            return T[what] || null;
+        }
         var EXT_busy = false;
         function EXT_hex(b) {
             return (b < 16 ? "0" : "") + b.toString(16);
@@ -2479,16 +2497,19 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
             setTimeout(tick, 0);
         }
         function EXT_run(what) {
-            var jobs = EXT_JOBS[what];
+            var jobs = (WK_BASE || what === "libkernel"
+                        || what === "stubzone") ? EXT_target(what) : null;
             if (EXT_busy) {
                 r3Log("EXT-FAIL", "reason=extraction-already-running");
                 r3Flush();
+                EXT_status("busy - an extraction is still streaming, wait.");
                 return;
             }
             if (!jobs) {
                 r3Log("EXT-FAIL", "what=" + what
                     + "-reason=unknown-or-base-missing");
                 r3Flush();
+                EXT_status("target unknown or base not locked yet.");
                 return;
             }
             EXT_busy = true;
@@ -2511,6 +2532,12 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
             })(0);
         }
         EXT_ready = true;
+        try {
+            var extBtns = document.querySelectorAll("#extbar button");
+            for (var bi = 0; bi < extBtns.length; ++bi)
+                extBtns[bi].disabled = false;
+            EXT_status("armed - buttons live. Press one = extract that one thing, whenever you want.");
+        } catch (_) {}
         setInterval(function () {
             bridgeSend({ t: "hb", src: "workshop-console", syscalls: syscalls,
                       ws: wsReady ? 1 : 0 });

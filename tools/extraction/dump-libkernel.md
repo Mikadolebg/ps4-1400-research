@@ -21,11 +21,12 @@ The workshop console ships the extraction built in. Once armed
 echo {"t":"extract","what":"libkernel"} >> bridge/commands.jsonl
 ```
 
-The other buttons / `what` values: `stubzone` (just the dense zone,
-fast), `webkit` (the low 2 MB of WebKit text — the gadget set),
-`anchors` (the proof anchors: the pair door, the GOT slot, the getpid
-stub, the errno gadget). The full file map of `extraction/` lives in
-`extraction/README.md`.
+The other buttons / `what` values, **one per target** (press when you
+want, nothing runs on its own): `stubzone` (just the dense zone, fast),
+`webkit` (the low 2 MB of WebKit text — the gadget set), and each proof
+anchor separately (`anchor-expm1`, `anchor-parseint`, `anchor-imp-error`,
+`anchor-base-start`, `stub-getpid`, `errno-gadget`). The full file map
+of `extraction/` lives in `extraction/README.md`.
 
 ## How the window is located at runtime
 

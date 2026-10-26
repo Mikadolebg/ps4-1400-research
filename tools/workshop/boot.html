@@ -18,11 +18,18 @@
 <pre id="out">WORKSHOP BOOT (workshop-boot)
 state: <span id="st">connecting...</span>
 
+HOW IT WORKS - two steps:
+  1. press the button below: it ARMS the exploit (the 5M-slot /
+     40 MB carrier - the law), then opens the workshop page.
+  2. on the WORKSHOP page: the extraction buttons at the top of
+     the screen. One button = one target (libkernel table, stub
+     zone, WebKit slice, or each proof anchor alone). Nothing
+     extracts until YOU press - and you can press whenever you
+     want, the chain stays armed the whole session.
+
 This page is deliberately thin (a few KB, zero exploit code, zero
-carrier: it CANNOT run out of memory). The exploit (the 5M-slot /
-40 MB carrier - the law) is armed ON COMMAND, from the PC over the
-bridge or with the buttons below.</pre>
-<button onclick="arm(5000000,512)">ARM THE EXPLOIT (the 5M law)</button>
+carrier: it CANNOT run out of memory).</pre>
+<button onclick="arm(5000000,512)">STEP 1 - ARM THE EXPLOIT (then choose your extractions on the next page)</button>
 <button class="b2" onclick="arm(4000000,384)">OOM relief arm (4M, untested)</button>
 <small>On an "out of memory" loop: close and reopen the browser, then
 come back here - the bridge reconnects on its own.</small>
