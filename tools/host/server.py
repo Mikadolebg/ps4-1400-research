@@ -8,20 +8,25 @@ stores the binary evidence dumps they send.
 
 Endpoints beyond static files:
   /log/<marker>            records one verdict marker (sent by the pages)
+  /extract/<name>/<off-hex>/<hex-bytes>
+                           a CHOSEN extraction (workshop button or bridge
+                           command) -> assembles extraction/<name>.bin.
+                           This is the only writer of extraction/: the
+                           folder contains exactly what YOU picked.
   /dump/<name>/<off-hex>/<hex-bytes>
-                           appends a binary chunk to extraction/<name>.bin
-                           at the given RELATIVE offset (< 1 MB guard)
+                           the AUTOMATIC per-run proof dumps of the chain
+                           (gadgets verified, stubs, anchors, ROP context)
+                           -> assembles runs/evidence/<name>.bin.
+                           Both take RELATIVE offsets (< 4 MB guard).
 
-Output (all git-ignored except the README):
+Output (all git-ignored except extraction/README.md):
   runs/                    the logs: journal_YYYY-MM-DD.log (everything,
                            timestamped, with the client IP),
                            last-session.txt (full trace of the latest
-                           session), last-verdicts.txt (verdict lines)
-  extraction/              every binary captured from the console: the
-                           one-click extractions (libkernel-window.bin,
-                           stubzone.bin, webkit-text.bin, anchor-*.bin)
-                           and the per-run evidence dumps (gadg-*,
-                           stub-*, fcall-*...). See extraction/README.md.
+                           session), last-verdicts.txt (verdict lines),
+                           evidence/ (the automatic proof dumps)
+  extraction/              ONLY the extractions you chose, file by file
+                           (see extraction/README.md).
 
 Usage:
   python tools/host/server.py [--port 8000] [--bind 0.0.0.0]
@@ -78,26 +83,26 @@ class HostHandler(SimpleHTTPRequestHandler):
                     f.write(line + "\n")
         print(line, flush=True)
 
-    # -- binary dumps ------------------------------------------------------
-    def _dump(self, rest):
+    # -- binary captures (chosen extractions + automatic evidence) --------
+    def _capture(self, rest, dest_dir, label):
         try:
             parts = rest.split("/")
             if len(parts) < 3:
                 return
             name = parts[0][:64].replace("\\", "_").replace(".", "_")
             offset = int(parts[1], 16)
-            # Guard: offsets are RELATIVE to the dump start (< 4 MB - the
-            # largest legitimate extraction is the 2 MB WebKit slice).
+            # Guard: offsets are RELATIVE to the capture start (< 4 MB -
+            # the largest legitimate extraction is the 2 MB WebKit slice).
             # A huge value means a page bug (an absolute address was
             # sent) -> refuse, never grow a file to gigabytes.
             if offset > 0x400000:
-                print("[%s] DUMP-REFUSED offset=0x%x too large (relative expected)"
-                      % (datetime.now().strftime("%H:%M:%S"), offset), flush=True)
+                print("[%s] %s-REFUSED offset=0x%x too large (relative expected)"
+                      % (datetime.now().strftime("%H:%M:%S"), label, offset),
+                      flush=True)
                 return
             data = bytes.fromhex(parts[2])
-            ddir = EXTRACTION_DIR
-            os.makedirs(ddir, exist_ok=True)
-            fp = os.path.join(ddir, name + ".bin")
+            os.makedirs(dest_dir, exist_ok=True)
+            fp = os.path.join(dest_dir, name + ".bin")
             with _write_lock:
                 size = os.path.getsize(fp) if os.path.exists(fp) else 0
                 with open(fp, "r+b" if os.path.exists(fp) else "wb") as f:
@@ -107,11 +112,11 @@ class HostHandler(SimpleHTTPRequestHandler):
                     else:
                         f.seek(offset)
                     f.write(data)
-            print("[%s] DUMP %s +0x%x (%d bytes)"
-                  % (datetime.now().strftime("%H:%M:%S"), name, offset, len(data)),
-                  flush=True)
+            print("[%s] %s %s +0x%x (%d bytes)"
+                  % (datetime.now().strftime("%H:%M:%S"), label, name,
+                     offset, len(data)), flush=True)
         except Exception as exc:
-            print("[DUMP-ERR] %s" % exc, flush=True)
+            print("[%s-ERR] %s" % (label, exc), flush=True)
 
     # -- routing ------------------------------------------------------------
     def do_GET(self):
@@ -124,8 +129,14 @@ class HostHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path.startswith("/extract/"):
+            self._capture(path[len("/extract/"):], EXTRACTION_DIR, "EXTRACT")
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path.startswith("/dump/"):
-            self._dump(path[len("/dump/"):])
+            self._capture(path[len("/dump/"):], EVIDENCE_DIR, "DUMP")
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -142,7 +153,7 @@ class HostHandler(SimpleHTTPRequestHandler):
 
 
 def main():
-    global RUNS_DIR, EXTRACTION_DIR
+    global RUNS_DIR, EXTRACTION_DIR, EVIDENCE_DIR
     ap = argparse.ArgumentParser(description="PS4 14.00 research host server")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--bind", default="0.0.0.0")
@@ -150,6 +161,9 @@ def main():
 
     RUNS_DIR = os.path.join(REPO_ROOT, "runs")
     os.makedirs(RUNS_DIR, exist_ok=True)
+
+    EVIDENCE_DIR = os.path.join(RUNS_DIR, "evidence")
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
     EXTRACTION_DIR = os.path.join(REPO_ROOT, "extraction")
     os.makedirs(EXTRACTION_DIR, exist_ok=True)
@@ -168,7 +182,8 @@ def main():
 
     server = ThreadingHTTPServer((args.bind, args.port), HostHandler)
     print("Serving %s on port %d" % (REPO_ROOT, args.port), flush=True)
-    print("Logs -> runs/ ; console captures -> extraction/", flush=True)
+    print("Logs + automatic proof dumps -> runs/ ; chosen extractions -> extraction/",
+          flush=True)
     print("Open on the console: http://<this-PC-IP>:%d/  (menu)" % args.port,
           flush=True)
     print("Ctrl+C to stop.", flush=True)

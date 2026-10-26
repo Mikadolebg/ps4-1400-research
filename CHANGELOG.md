@@ -6,13 +6,17 @@ version numbers (git history is the only file history).
 
 ## [Unreleased]
 
-- **One-click extraction from the workshop**: EXTRACT buttons on the
-  console page (libkernel stub table, stub zone, WebKit text slice,
-  proof anchors) and a matching `{"t":"extract","what":...}` bridge
-  command. All captures now land in the dedicated `extraction/` folder
-  on the PC (git-ignored, self-documenting via its README), replacing
-  the old `runs/dumps/` location. New markers: `EXT-START`, `EXT-DONE`,
-  `EXT-FAIL`.
+- **One-click extraction from the workshop**: sticky per-target EXTRACT
+  buttons on the console page (libkernel stub table, stub zone, WebKit
+  text slice, and each proof anchor individually) and a matching
+  `{"t":"extract","what":...}` bridge command. Chosen extractions stream
+  through a dedicated `/extract/` endpoint into `extraction/` — the
+  folder now contains exactly what you picked and nothing else: the
+  chain's automatic per-run proof dumps moved to the separate
+  `runs/evidence/` (via `/dump/`), so nothing ever lands in
+  `extraction/` unless a button or a bridge command started it.
+  Buttons unlock visibly at WORKSHOP-READY (grayed out before). New
+  markers: `EXT-START`, `EXT-DONE`, `EXT-FAIL`.
 
 ## v1.0.0 — 2026-10-26
 

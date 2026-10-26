@@ -1,8 +1,9 @@
 # Verdict markers — the vocabulary of the tooling
 
 The pages emit marker lines to the screen, to the host server
-(`/log/`, captured in `runs/last-verdicts.txt`), and evidence dumps
-(`/dump/` -> `extraction/*.bin`). Markers are the product's
+(`/log/`, captured in `runs/last-verdicts.txt`), chosen extractions
+(`/extract/` -> `extraction/*.bin`) and the automatic per-run proof
+dumps (`/dump/` -> `runs/evidence/*.bin`). Markers are the product's
 vocabulary — stable, functional, and self-describing. This glossary
 tells you what each one *proves*.
 

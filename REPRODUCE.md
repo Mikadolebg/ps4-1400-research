@@ -56,8 +56,9 @@ FCALL-DONE verdict=FCALL-GETPID-OK
 ```
 
 On the PC side the same lines land in `runs/last-verdicts.txt`, and
-binary evidence (stub bytes, gadget bytes, the anchors) in
-`runs/dumps/`.
+the chain's automatic proof dumps (gadget bytes, stub bytes, the
+anchors) in `runs/evidence/` — the `extraction/` folder stays empty
+until YOU press an extraction button.
 
 **That is the userland chain reproduced: entry, R/W, base leak, ROP,
 arbitrary syscall.** From here, `SYSCALL-PASS` for any number in

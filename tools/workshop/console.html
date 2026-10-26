@@ -2445,9 +2445,11 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
         };
         // ---- ONE-CLICK EXTRACTION ----------------------------------------
         // One button = one target, pressed when YOU choose (nothing ever
-        // extracts on its own). Streams chunks to the host's /dump/
-        // endpoint, which assembles the files under extraction/ on the PC
-        // (see extraction/README.md for the file map).
+        // extracts on its own). Streams chunks to the host's /extract/
+        // endpoint - the ONLY writer of extraction/ on the PC. (The
+        // automatic per-run proof dumps of the chain go to the separate
+        // /dump/ endpoint -> runs/evidence/ on the PC, by design.)
+        // File map: extraction/README.md.
         var EXT_CHUNK = 0x400, EXT_PER_TICK = 6, EXT_TICK_MS = 60;
         function EXT_target(what) {
             var T = {
@@ -2477,7 +2479,7 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
                         h += EXT_hex(ext_read8(start + off + i));
                     try {
                         var x = new XMLHttpRequest();
-                        x.open("GET", "/dump/" + name + "/"
+                        x.open("GET", "/extract/" + name + "/"
                             + off.toString(16) + "/" + h, true);
                         x.send();
                     } catch (_) {}
@@ -2536,7 +2538,7 @@ var STUB_TABLE = {"12":21168,"73":21200,"441":21232,"125":21264,"442":21296,"80"
             var extBtns = document.querySelectorAll("#extbar button");
             for (var bi = 0; bi < extBtns.length; ++bi)
                 extBtns[bi].disabled = false;
-            EXT_status("armed - buttons live. Press one = extract that one thing, whenever you want.");
+            EXT_status("armed - buttons live. Press one = extract that one thing. Nothing runs on its own.");
         } catch (_) {}
         setInterval(function () {
             bridgeSend({ t: "hb", src: "workshop-console", syscalls: syscalls,

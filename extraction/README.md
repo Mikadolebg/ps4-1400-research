@@ -1,9 +1,14 @@
-# extraction/ — everything captured from the console
+# extraction/ — ONLY the extractions you chose
 
-This folder receives **every binary the console pages stream to the
-host's `/dump/` endpoint**. It is local-only (git-ignored; this README
-is the only tracked file in here). The logs and verdict markers live
-separately in `runs/`.
+This folder receives **exactly what you picked, file by file**: every
+extraction started by a workshop button or a bridge `extract` command,
+and nothing else. It is local-only (git-ignored; this README is the
+only tracked file in here).
+
+**Nothing lands here on its own.** The automatic proof dumps the chain
+produces during every run (the byte-verified gadgets, stubs, ROP
+context...) go to a separate folder — `runs/evidence/` — so what you
+see here is always the result of your own clicks.
 
 ## The one-click extractions (one button = one target, on the workshop
 page; or `{"t":"extract","what":...}` over the bridge)
@@ -25,9 +30,10 @@ chain stays armed the whole session; nothing extracts on its own). The
 buttons unlock at `WORKSHOP-READY` — the status line under them says
 so.
 
-## The per-run evidence dumps (automatic, every session)
+## The automatic per-run evidence (NOT here — runs/evidence/)
 
-The pages dump their own proofs as they run — you will also find here:
+The pages dump their own proofs as they run — you will find those in
+**`runs/evidence/`**, not here:
 
 - `gadg-<NAME>.bin` (0x10 each): the runtime bytes of every verified
   gadget (written by the gadget gate on each run);
@@ -38,6 +44,9 @@ The pages dump their own proofs as they run — you will also find here:
   KEX replay (`tools/workshop/kex-aio.html`);
 - `expm1-anchor.bin`, `parseint-anchor.bin`, `base-start.bin`,
   `imp-error.bin`: the leak-layer anchors.
+
+That split is deliberate: `extraction/` answers "what did I ask for",
+`runs/evidence/` answers "what did the chain prove this session".
 
 ## Reminders
 

