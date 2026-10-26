@@ -1,0 +1,16 @@
+# Local French mirror — kept for the maintainer, never published
+fr/
+
+# Local run artifacts produced by tools/host/server.py and bridge.py
+runs/
+bridge/
+logs/
+*.log
+
+# Local memory dumps (share them via GitHub Releases instead, never commit)
+dumps/
+*.bin
+
+# Python
+__pycache__/
+*.pyc
