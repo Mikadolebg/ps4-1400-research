@@ -5,6 +5,28 @@ Status legend: **OPEN** (measured alive somewhere, 14.00 unknown),
 tool in this repo that takes you there. Read `06-negative-results.md`
 first — several intuitive leads there are closed.
 
+## 1b. The `aio_multi_delete` TOCTOU (Lapse family) — REOPENED, strongest shape
+
+**Why it is the top candidate (2026-10-27 cross-evidence):**
+- The 13.52 kernel shows the exact shape the PS5 scene says Sony fixed
+  in **PS5 14.20**: a lock upgrade (drop-and-reacquire) on the AIO
+  group inside `sys_aio_multi_delete`, then sub-object frees with no
+  generation-ID revalidation. The fix landed AFTER our 14.00 build.
+- On-device: delete (662) is alive and ungated on 14.00 (gates table).
+- The window is the lock-upgrade span (microseconds), not a 1 ns
+  preemption lottery — a real TOCTOU, winnable with timing control.
+- **The public Lapse chain (11.00-12.02) is in hand and documents the
+  full recipe**: the browser's Web Workers are in-process kernel
+  threads on this same frozen WebKit engine — the chain arms a worker
+  from the main thread's R/W (walk into worker memory, hijack its
+  context) and RPCs syscalls into it, giving TWO concurrent syscall
+  streams plus nanosleep/sched_yield for race timing.
+
+**Next probe:** port the Lapse worker-arming to our 14.00 workshop
+(verify workers on the frozen engine first — one eval), then replay
+the delete race against our measured-alive handler with the group
+teardown timed into the upgrade window.
+
 ## 2. `/dev/dipsw` ioctl window — UNTESTED, highest value-per-unknown
 
 **What is proven already:** `open("/dev/dipsw")` **succeeds** from the

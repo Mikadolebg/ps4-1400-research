@@ -62,3 +62,15 @@ The instruction-level audit of all six handlers on 13.52 found the
 family hardened *except* this lifetime window — the "75% new code in
 13.52" premise was a function-matching artifact (the family exists
 since 10.50). Only the wait bug was real; 14.00 gates exactly it.
+
+
+## Post-scriptum (2026-10-27): the DELETE race is a separate, reopened door
+
+The closure above concerns the **wait**-side UAF only. PS5-scene
+firmware-diff intelligence (fix shipped in PS5 14.20: generation-ID
+revalidation after the lock re-acquire) plus our own 13.52
+disassembly (lock-upgrade drop window in `sys_aio_multi_delete`, no
+identity check) reclassify the **delete-path TOCTOU** as alive through
+the 14.00 era. Combined with the public Lapse chain's worker-thread
+recipe (in-process Web Workers on this same engine), this is the
+strongest current kernel lead — see `07-next-leads.md` §1b.
