@@ -63,8 +63,50 @@ that proof: the sensor read back the accumulated event mask of OUR queue
 reachable from the browser's stubs, with zero crash risk. The race (free
 the socket under the window, spray the UMA zone) is the remaining step.
 
-## Why it survived the 14.00 gates
+## Session 2 (2026-10-27, later) — the close path measured, the lottery quantified
 
-The 4 stubs it needs are **not gated** (proven live above — netcontrol
-register/raise/sensor all returned 0). The hardened frontier on 14.00
-(gates table) does not cover this path; only hardware time does.
+Follow-up probes the same night settled the remaining questions:
+
+- **The purge DOES run at close.** After `close(fd)`, the registered
+  queue no longer accumulates events under heavy traffic (sensor reads
+  stay 0) — Sony's double-free fix works as designed. The earlier
+  static suspicion ("purge never runs because nothing writes the
+  +0x76 marker") was wrong: the marker is set by a path my byte scans
+  (no REX/SIB encodings) missed. **There is no deterministic dangling
+  owner** — the preemption lottery is the only door, exactly as the
+  original design rated it.
+- **The notification's indirect call is NULL-gated**: the raise's
+  post-write notify only does `call rax` when `[owner+0x180] != 0`
+  (verified at +0x1e66bd). Bare, never-selected sockets have it NULL
+  -> a race WON on our own throwaway blocks would be benign by
+  construction (word 4 at +0x70, cmpxchg at +0xf8, no indirect call).
+- **Measured loop rate**: ~3000 socket/register/close iterations per
+  second through the armed ROP series (500 iterations in 169 ms).
+- **Measured raise pressure**: traffic XHR bursts drove masks like
+  `0x2010000d` into our queue (many distinct event sources).
+- **Lottery odds, honestly computed**: the raise's [owner-read ->
+  write] gap is ~1 ns; the free needs the raise thread descheduled
+  exactly there -> ~1e-6 per overlapping raise, ~1e-8 per iteration.
+  At 3000 iter/s that is ~1e-4 wins/s — hours of tight looping per
+  coin flip, and only on the traffic-bearing ifnet.
+- **New phenomenon — ifnet slot wedging**: after intensive
+  register/close churn, ifnet 1's three queue slots stopped accepting
+  registrations (every `REGISTER` returns the impl's literal -1),
+  while ifnets 2-4 still accept and cleanly unregister. Recovery
+  requires a console reboot; root mechanism not yet isolated (open
+  question, next session).
+- **Clean UNREGISTER proven on device**: `netcontrol(id, 0x20000007,
+  {fd}, 8)` round-trips 0/0 on a fresh ifnet — the hygiene call for
+  any future race harness.
+
+## Next-session plan (measured, not guessed)
+
+1. Reboot the console (clears the wedged ifnet-1 slots).
+2. Volume lottery on ifnet 1: in-page tight loop (3000 iter/s
+   measured) with traffic bursts, batches with health checks between.
+   Odds ~1e-8/iter — decide the time budget with the numbers above; a
+   win on our own blocks is benign (NULL-gated notify) and the signal
+   is a state-dependent errno anomaly on the reoccupied socket.
+3. In parallel, isolate the slot-wedging mechanism (a second bug
+   candidate in itself: a resource-exhaustion / refcount path in the
+   netcontrol register machinery).

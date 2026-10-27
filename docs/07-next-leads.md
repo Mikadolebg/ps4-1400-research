@@ -68,8 +68,15 @@ preemption lottery), and a lost attempt in a bad state is a kernel
 panic (accepted, documented, reboot). The winning signal without KASLR:
 the reoccupied socket's connect() returning an abnormal errno.
 
-**Next probe:** a raise-and-close loop driven from the PC (one cycle
-per session per the law), with the console state saved beforehand.
+**Next probe (measured 2026-10-27):** the purge at close is CONFIRMED
+on device (no deterministic dangling — the lottery stands), the notify
+indirect call is NULL-gated (wins on our own throwaway blocks are
+benign), the in-page loop runs at 3000 iter/s, and the honest odds are
+~1e-8/iteration. Plan: reboot (clears the wedged ifnet-1 slots), then a
+volume lottery with health-checked batches — or bank the hours and work
+the slot-wedging mechanism (a fresh bug candidate found by the same
+session: ifnet queue slots stop accepting registrations after intensive
+churn; ifnets 2-4 unaffected; clean-unregister command identified).
 
 ## 5. Remote Play parsers (TCP 9295 / UDP 987, console side) — OPEN
 
